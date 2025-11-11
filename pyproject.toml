@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-engine-core"
+# The version is managed by semantic-release and will be updated automatically.
+version = "0.0.0"
+authors = [
+  { name="Trading Systems Team", email="ven.ajie@protonmail.com" },
+]
+description = "Core data contracts and models for the trading engine."
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pydantic>=2.0",
+]
+
+# Defines the URL for the GitHub Packages registry.
+# Replace 'OWNER' with the GitHub organization or username.
+# Replace 'trading-app-services' with the name of the primary application repository
+# if you wish to link packages to it.
+[project.urls]
+"Homepage" = "https://github.com/venoajie/trading-engine-core"
+"Repository" = "https://github.com/venoajie/trading-engine-core"
+
+# Defines optional dependencies for development.
+# These are installed by `pip install -e .[dev]`.
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "black>=24.0",
+    "codecov>=2.1",
+    "python-semantic-release>=9.0",
+    "build>=1.0",
+]
+
+# Configuration for the Ruff linter.
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "T20", "SIM", "PTH"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+# Configuration for Pytest coverage reporting.
+[tool.pytest.ini_options]
+addopts = "--cov=src --cov-report=term-missing"
+testpaths = [
+    "tests",
+]
+
+# Configuration telling publishing tools where to upload the package.
+# The 'repository' URL must match the target GitHub Packages registry.
+# Replace 'OWNER' with the GitHub organization or username.
+[[tool.setuptools.publish]]
+repository = "https://pypi.pkg.github.com/OWNER/"

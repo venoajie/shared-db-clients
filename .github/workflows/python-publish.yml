@@ -1,0 +1,109 @@
+# .github/workflows/python-publish.yml
+#
+# Standardized CI/CD pipeline for shared Python libraries.
+#
+# This workflow performs the following actions:
+# 1. On Pull Requests to `main`:
+#    - Lints code using Ruff.
+#    - Runs unit tests with Pytest and enforces a 95% coverage minimum.
+# 2. On Push to `main` (after a PR is merged):
+#    - Performs all the above checks.
+#    - If checks pass, it uses python-semantic-release to:
+#      - Determine the next semantic version based on conventional commit messages.
+#      - Generate a CHANGELOG.md.
+#      - Create a new Git tag and GitHub Release.
+#      - Build the source distribution and wheel.
+#      - Publish the package to the GitHub Packages registry.
+
+name: Python Package CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Assumes Python 3.11 is the target version.
+        # This can be expanded (e.g., [3.10, 3.11, 3.12]) to test against multiple versions.
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Required for semantic-release to analyze commit history.
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip' # Cache dependencies for faster runs
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev] # Install package in editable mode with dev dependencies
+
+      - name: Lint with Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Test with Pytest and generate coverage report
+        run: |
+          pytest \
+            --cov=src \
+            --cov-report=xml \
+            --cov-fail-under=95 # Enforces the 95% coverage requirement from Epic 1.1
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }} # Repository secret for Codecov.io
+          file: ./coverage.xml
+          fail_ci_if_error: true
+
+  publish:
+    name: Publish to GitHub Packages
+    needs: validate
+    runs-on: ubuntu-latest
+    # This job only runs on a direct push to the main branch, not on PRs.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    # The GITHUB_TOKEN requires write permissions to create releases and publish packages.
+    permissions:
+      contents: write # To create releases and tags
+      packages: write # To publish packages to GitHub Packages registry
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build and release dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build python-semantic-release
+
+      - name: Perform Semantic Release
+        env:
+          # The GITHUB_TOKEN is automatically provided by GitHub Actions.
+          # It is used for authenticating with the GitHub API and GitHub Packages.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          semantic-release publish
