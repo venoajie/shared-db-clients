@@ -25,8 +25,19 @@ classifiers = [
 ]
 # Define production dependencies here.
 dependencies = [
-    "asyncpg", # Example dependency
-    "redis",   # Example dependency
+    "aiohttp==3.12.7",
+    "asyncpg==0.30.0",
+    "loguru==0.7.2",
+    "orjson==3.10.18",
+    "pydantic-settings==2.3.0",
+    "redis==5.0.4",
+    "tomli==2.0.1",
+    "uvloop>=0.21.0",
+
+    "shared-logging @ git+https://github.com/venoajie/shared-logging.git@v0.1.0",
+    "shared-utils @ git+https://github.com/venoajie/shared-utils.git@v0.1.0",
+    "shared-config @ git+https://github.com/venoajie/shared-config.git@v0.1.0",
+
 ]
 
 [project.urls]
