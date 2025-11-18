@@ -7,6 +7,15 @@ from loguru import logger as log
 from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, timezone, timedelta
 
+# --- DIAGNOSTIC WRAPPER ---
+# This will catch the underlying configuration error and log it.
+try:
+    from shared_config.config import settings
+except Exception as e:
+    log.exception(f"CRITICAL: Failed to import 'settings' from shared_config. This is likely a configuration error. Underlying Exception: {e}")
+    # Re-raise to ensure the service still fails to start, but now with a clear log.
+    raise
+
 from shared_config.config import settings
 
 
