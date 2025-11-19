@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "shared-db-clients" # Example for this specific library
 # The version is managed by semantic-release and will be updated automatically on release.
-version = "0.1.1"
+version = "0.1.2"
 authors = [
   { name = "Trading Systems Team", email = "ven.ajie@protonmail.com" },
 ]
