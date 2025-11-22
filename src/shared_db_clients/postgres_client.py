@@ -1,28 +1,28 @@
 # src\shared_db_clients\postgres_client.py
 
 import asyncio
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
 import asyncpg
 import orjson
 from loguru import logger as log
-from typing import Any, List, Dict, Tuple, Optional
-from datetime import datetime, timezone, timedelta
-
-from shared_config.config import settings, PostgresSettings
+from shared_config.config import PostgresSettings, settings
 
 
 class PostgresClient:
     _pool: asyncpg.Pool = None
 
-    def __init__(self, config: Optional[PostgresSettings] = None):
+    def __init__(self, config: PostgresSettings | None = None):
         """
         Initializes the PostgresClient.
-        
+
         Args:
             config: Optional PostgresSettings object. If None, falls back to the global 'settings.postgres'.
                     This allows for Dependency Injection during testing.
         """
         self.postgres_settings = config or settings.postgres
-        
+
         # Lazy validation: We don't raise an error immediately if config is missing,
         # to allow partial usage of shared-db-clients (e.g. Redis-only consumers).
         # We only check self.dsn when start_pool() is called.
@@ -33,7 +33,9 @@ class PostgresClient:
 
     async def start_pool(self) -> asyncpg.Pool:
         if not self.dsn:
-            raise ValueError("Cannot start PostgreSQL pool: No PostgreSQL configuration found.")
+            raise ValueError(
+                "Cannot start PostgreSQL pool: No PostgreSQL configuration found."
+            )
 
         if self._pool is None or self._pool._closed:
             log.info("PostgreSQL connection pool is not available. Creating new pool.")
@@ -49,13 +51,11 @@ class PostgresClient:
                             "application_name": "trading-system-db-client",
                         },
                     )
-                    log.info(
-                        f"PostgreSQL pool created successfully."
-                    )
+                    log.info("PostgreSQL pool created successfully.")
                     return self._pool
                 except Exception as e:
                     log.error(
-                        f"Failed to create PostgreSQL pool (attempt {attempt+1}/5): {e}"
+                        f"Failed to create PostgreSQL pool (attempt {attempt + 1}/5): {e}"
                     )
                     await asyncio.sleep(2**attempt)
             raise ConnectionError(
@@ -73,7 +73,6 @@ class PostgresClient:
         self,
         connection: asyncpg.Connection,
     ):
-
         for json_type in ["jsonb", "json"]:
             await connection.set_type_codec(
                 json_type,
@@ -106,7 +105,6 @@ class PostgresClient:
                 return timedelta(seconds=value)
 
         try:
-
             if resolution.upper().endswith("D"):
                 return timedelta(days=int(resolution[:-1]))
             if resolution.upper().endswith("W"):
@@ -119,10 +117,9 @@ class PostgresClient:
 
     def _prepare_ohlc_record(
         self,
-        candle_data: Dict[str, Any],
-    ) -> Tuple:
-
-        tick_dt = datetime.fromtimestamp(candle_data["tick"] / 1000, tz=timezone.utc)
+        candle_data: dict[str, Any],
+    ) -> tuple:
+        tick_dt = datetime.fromtimestamp(candle_data["tick"] / 1000, tz=UTC)
         resolution_str = candle_data["resolution"]
         resolution_td = self._parse_resolution_to_timedelta(resolution_str)
 
@@ -141,9 +138,8 @@ class PostgresClient:
 
     async def bulk_upsert_tickers(
         self,
-        tickers_data: List[Dict[str, Any]],
+        tickers_data: list[dict[str, Any]],
     ):
-
         if not tickers_data:
             return
         query = """
@@ -174,7 +170,7 @@ class PostgresClient:
                 )
                 continue
 
-            ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            ts = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
             records_to_upsert.append(
                 (
                     ticker.get("instrument_name"),
@@ -202,9 +198,8 @@ class PostgresClient:
 
     async def bulk_upsert_ohlc(
         self,
-        candles: List[Dict[str, Any]],
+        candles: list[dict[str, Any]],
     ):
-
         if not candles:
             return
 
@@ -226,7 +221,7 @@ class PostgresClient:
             except asyncpg.PostgresError as e:
                 if "does not exist" in str(e):
                     log.warning(
-                        f"Database schema not ready (attempt {attempt + 1}/5). Retrying OHLC upsert in {2 ** attempt}s. Error: {e}"
+                        f"Database schema not ready (attempt {attempt + 1}/5). Retrying OHLC upsert in {2**attempt}s. Error: {e}"
                     )
                     await asyncio.sleep(2**attempt)
                     continue
@@ -246,7 +241,7 @@ class PostgresClient:
 
     async def bulk_upsert_instruments(
         self,
-        instruments: List[Dict[str, Any]],
+        instruments: list[dict[str, Any]],
         exchange: str,
     ):
         if not instruments:
@@ -296,7 +291,7 @@ class PostgresClient:
 
     async def bulk_upsert_orders(
         self,
-        records: List[Dict[str, Any]],
+        records: list[dict[str, Any]],
     ):
         """
         Upserts a batch of order records into the orders table.
@@ -317,7 +312,7 @@ class PostgresClient:
 
     async def bulk_insert_public_trades(
         self,
-        records: List[Dict[str, Any]],
+        records: list[dict[str, Any]],
     ):
         """Inserts public trades by converting dicts to DB tuples"""
         if not records:
@@ -366,7 +361,7 @@ class PostgresClient:
 
     async def delete_orders(
         self,
-        orders_to_delete: List[Tuple[str, str, str]],
+        orders_to_delete: list[tuple[str, str, str]],
     ):
         if not orders_to_delete:
             return
@@ -384,7 +379,7 @@ class PostgresClient:
     async def insert_account_information(
         self,
         user_id: str,
-        data: Dict[str, Any],
+        data: dict[str, Any],
     ) -> None:
         query = """
             INSERT INTO account_information (user_id, data) VALUES ($1, $2)
@@ -394,7 +389,7 @@ class PostgresClient:
         async with pool.acquire() as conn:
             await conn.execute(query, user_id, data)
 
-    async def fetch_all_instruments(self) -> List[asyncpg.Record]:
+    async def fetch_all_instruments(self) -> list[asyncpg.Record]:
         pool = await self.start_pool()
         async with pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM v_instruments")
@@ -402,8 +397,7 @@ class PostgresClient:
     async def fetch_active_trades(
         self,
         user_id: str = None,
-    ) -> List[asyncpg.Record]:
-
+    ) -> list[asyncpg.Record]:
         query = "SELECT * FROM v_active_trades"
         params = []
         if user_id:
@@ -416,7 +410,7 @@ class PostgresClient:
     async def fetch_open_orders(
         self,
         user_id: str = None,
-    ) -> List[asyncpg.Record]:
+    ) -> list[asyncpg.Record]:
         query = """
             SELECT * FROM orders
             WHERE trade_id IS NULL
@@ -435,7 +429,7 @@ class PostgresClient:
     async def fetch_all_user_records(
         self,
         user_id: str,
-    ) -> Tuple[List[asyncpg.Record], List[asyncpg.Record]]:
+    ) -> tuple[list[asyncpg.Record], list[asyncpg.Record]]:
         query = "SELECT * FROM orders WHERE user_id = $1 ORDER BY exchange_timestamp"
         pool = await self.start_pool()
         async with pool.acquire() as conn:
@@ -451,15 +445,15 @@ class PostgresClient:
         start_ts_ms: int,
         end_ts_ms: int,
         exchange_name: str,
-    ) -> List[asyncpg.Record]:
+    ) -> list[asyncpg.Record]:
         query = """
                 SELECT trade_id FROM orders
                 WHERE exchange = $3
                 AND trade_id IS NOT NULL
                 AND exchange_timestamp >= $1 AND exchange_timestamp <= $2
             """
-        start_dt = datetime.fromtimestamp(start_ts_ms / 1000, tz=timezone.utc)
-        end_dt = datetime.fromtimestamp(end_ts_ms / 1000, tz=timezone.utc)
+        start_dt = datetime.fromtimestamp(start_ts_ms / 1000, tz=UTC)
+        end_dt = datetime.fromtimestamp(end_ts_ms / 1000, tz=UTC)
         pool = await self.start_pool()
         async with pool.acquire() as conn:
             return await conn.fetch(query, start_dt, end_dt, exchange_name)
@@ -494,7 +488,7 @@ class PostgresClient:
     async def fetch_all_trades_for_instrument(
         self,
         instrument_name: str,
-    ) -> List[asyncpg.Record]:
+    ) -> list[asyncpg.Record]:
         query = """
             SELECT trade_id, label, side, amount,
                 CASE WHEN side = 'sell' THEN -amount ELSE amount END AS net_amount
@@ -507,7 +501,7 @@ class PostgresClient:
 
     async def bulk_update_is_open_status(
         self,
-        trade_ids: List[str],
+        trade_ids: list[str],
         is_open: bool,
     ):
         if not trade_ids:
@@ -530,7 +524,7 @@ class PostgresClient:
         instrument_name: str,
         resolution: str,
         limit: int,
-    ) -> List[asyncpg.Record]:
+    ) -> list[asyncpg.Record]:
         query = """
             SELECT "open", high, low, "close", tick, volume
             FROM ohlc
@@ -554,7 +548,7 @@ class PostgresClient:
         exchange_name: str,
         instrument_name: str,
         resolution_td: timedelta,
-    ) -> Optional[datetime]:
+    ) -> datetime | None:
         query = "SELECT MAX(tick) FROM ohlc WHERE exchange = $1 AND instrument_name = $2 AND resolution = $3"
         try:
             pool = await self.start_pool()
@@ -576,7 +570,7 @@ class PostgresClient:
         self,
         exchange_name: str,
         instrument_name: str,
-    ) -> Optional[datetime]:
+    ) -> datetime | None:
         """
         [NEW] Fetches the timestamp of the most recent public trade for a given
         instrument from the database.
@@ -594,7 +588,7 @@ class PostgresClient:
 
     async def fetch_futures_summary_for_exchange(
         self, exchange: str
-    ) -> Optional[asyncpg.Record]:
+    ) -> asyncpg.Record | None:
         """
         Fetches the aggregated futures summary for a specific exchange.
         """
@@ -622,7 +616,7 @@ class PostgresClient:
     async def fetch_all_trades_for_user(
         self,
         user_id: str,
-    ) -> List[asyncpg.Record]:
+    ) -> list[asyncpg.Record]:
         query = """
             SELECT trade_id, label, side, amount, instrument_name,
                 CASE WHEN side = 'sell' THEN -amount ELSE amount END AS net_amount

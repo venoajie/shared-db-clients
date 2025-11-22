@@ -1,12 +1,12 @@
 # core/health.py
 import asyncio
+from datetime import UTC, datetime
+
 import aiohttp
 import psutil
-from datetime import datetime, timezone
-from loguru import logger as log
-
 from core.db.postgres import PostgresClient
 from core.db.redis import CustomRedisClient
+from loguru import logger as log
 
 # --- Configuration for the new time sanity check ---
 TIME_SOURCES = [
@@ -50,7 +50,7 @@ async def check_time_sanity():
                         # Format: 'Wed, 16 Jul 2025 05:47:41 GMT'
                         real_utc_time = datetime.strptime(
                             date_header, "%a, %d %b %Y %H:%M:%S %Z"
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                     elif "cloudflare.com" in source_url:
                         # Cloudflare's trace endpoint provides a 'ts=' line with a Unix timestamp
                         text_data = await response.text()
@@ -58,7 +58,7 @@ async def check_time_sanity():
                             if line.startswith("ts="):
                                 ts_str = line.split("=")[1]
                                 real_utc_time = datetime.fromtimestamp(
-                                    float(ts_str), tz=timezone.utc
+                                    float(ts_str), tz=UTC
                                 )
                                 break
                         if not real_utc_time:
@@ -69,7 +69,7 @@ async def check_time_sanity():
                     if not real_utc_time:
                         continue  # Should not happen if parsing logic is correct
 
-                    system_utc_time = datetime.now(timezone.utc)
+                    system_utc_time = datetime.now(UTC)
                     time_skew = abs((system_utc_time - real_utc_time).total_seconds())
 
                     log.info(f"Successfully fetched time from {source_url}")
