@@ -403,3 +403,78 @@ async def test_utilities(client, mock_pool_and_conn):
     mock_conn.execute.assert_called()
 
     assert client._parse_resolution_to_timedelta("1 minute") == timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_json_codec_lambdas(client):
+    """Explicitly test the lambda functions passed to set_type_codec to hit line 63."""
+    mock_conn = AsyncMock()
+    await client._setup_json_codec(mock_conn)
+
+    # Retrieve the calls
+    calls = mock_conn.set_type_codec.await_args_list
+    assert len(calls) >= 1
+
+    # Extract kwargs from the first call (for 'jsonb' or 'json')
+    _, kwargs = calls[0]
+    encoder = kwargs.get("encoder")
+    decoder = kwargs.get("decoder")
+
+    # Execute the lambdas to generate coverage
+    test_dict = {"key": "value"}
+    encoded = encoder(test_dict)
+    assert isinstance(encoded, str)
+    assert '"key":"value"' in encoded.replace(" ", "")  # Handle potential spacing diffs
+
+    decoded = decoder('{"key": "value"}')
+    assert decoded == test_dict
+
+
+@pytest.mark.asyncio
+async def test_start_pool_recovery(mock_pg_config):
+    """Test the loop logic: Fail once, then succeed (Lines 97-115 coverage)."""
+    client = PostgresClient(config=mock_pg_config)
+
+    # Mock create_pool to fail once, then return a pool
+    mock_pool = AsyncMock()
+    mock_pool._closed = False
+
+    with patch(
+        "asyncpg.create_pool", side_effect=[Exception("Temp Fail"), mock_pool]
+    ) as mock_create:
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            pool = await client.start_pool()
+
+    assert pool is mock_pool
+    assert mock_create.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_upsert_instruments_timestamps(client, mock_pool_and_conn):
+    """Test ISO parsing logic in upsert_instruments (Lines 228-229)."""
+    _, mock_conn = mock_pool_and_conn
+
+    # Case 1: Valid Timestamp
+    inst_valid = {
+        "exchange": "binance",
+        "instrument_name": "A",
+        "expiration_timestamp": "2025-01-01T00:00:00+00:00",
+    }
+    # Case 2: No Timestamp
+    inst_none = {
+        "exchange": "binance",
+        "instrument_name": "B",
+        "expiration_timestamp": None,
+    }
+
+    await client.bulk_upsert_instruments([inst_valid, inst_none], "binance")
+
+    # Verify call
+    mock_conn.executemany.assert_called_once()
+    args = mock_conn.executemany.call_args[0]
+    records = args[1]
+
+    # Check valid parsed date
+    assert isinstance(records[0][10], datetime)
+    # Check None
+    assert records[1][10] is None

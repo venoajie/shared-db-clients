@@ -236,3 +236,43 @@ async def test_parse_message(client):
     # Bad Decode
     res = CustomRedisClient.parse_stream_message({b"data": b"\xff"})
     assert res["data"] == b"\xff"
+
+
+@pytest.mark.asyncio
+async def test_get_pool_stale_reconnect(client):
+    """Test get_pool when existing pool ping fails (Lines 32-37)."""
+    # 1. Setup an existing "stale" pool
+    mock_stale_pool = MagicMock()
+    mock_stale_pool.ping = AsyncMock(side_effect=TimeoutError("Stale"))
+    mock_stale_pool.close = AsyncMock()
+    client.pool = mock_stale_pool
+
+    # 2. Setup the "new" pool that works
+    mock_new_pool = MagicMock()
+    mock_new_pool.ping = AsyncMock(return_value=True)
+
+    with patch("redis.asyncio.from_url", return_value=mock_new_pool):
+        # This should trigger _safe_close_pool, then create new
+        pool = await client.get_pool()
+
+    assert pool is mock_new_pool
+    mock_stale_pool.close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deep_exception_coverage(client):
+    """Target specific logging exception blocks."""
+    mock_pool = AsyncMock()
+    client.get_pool = AsyncMock(return_value=mock_pool)
+
+    # 1. Dequeue OHLC generic exception (Line 359)
+    mock_pool.brpop.side_effect = Exception("Boom")
+    assert await client.dequeue_ohlc_work() is None
+
+    # 2. Queue Size generic exception (Line 371)
+    mock_pool.llen.side_effect = Exception("Boom")
+    assert await client.get_ohlc_work_queue_size() == 0
+
+    # 3. Get Ticker generic exception (Line 403)
+    mock_pool.hget.side_effect = Exception("Boom")
+    assert await client.get_ticker_data("inst") is None
