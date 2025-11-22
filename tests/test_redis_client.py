@@ -41,44 +41,57 @@ async def test_parse_stream_message():
 
 @pytest.mark.asyncio
 async def test_xadd_bulk_success(client):
-    mock_pool = AsyncMock()
-    client.pool = mock_pool
-    # Mock locking and semaphore
-    client._lock = AsyncMock()
-
-    # Setup pipeline mock
+    # Mock the pipeline object
     mock_pipe = AsyncMock()
+
+    # Mock the pool to return the pipeline
+    mock_pool = AsyncMock()
     mock_pool.pipeline.return_value = mock_pipe
+
+    client.pool = mock_pool
+    # Mock get_pool to return our mock pool
+    client.get_pool = AsyncMock(return_value=mock_pool)
+
+    client._lock = AsyncMock()
 
     messages = [{"id": 1}, {"id": 2}]
     await client.xadd_bulk("test_stream", messages)
 
+    # xadd is a synchronous method on the pipeline object in redis-py (it just queues commands)
+    # but execute() is async.
+    # However, in our code we do `pipe.xadd(...)`.
+    # If using redis.asyncio, pipeline methods are usually not awaitable, only execute() is.
     assert mock_pipe.xadd.call_count == 2
     mock_pipe.execute.assert_awaited()
 
 
 @pytest.mark.asyncio
 async def test_xadd_dlq_fallback(client):
-    mock_pool = AsyncMock()
-    client.pool = mock_pool
+    # Mock xadd_bulk raising ConnectionError
+    # We need to simulate the internal failure of the try/except block in xadd_bulk
 
-    # Mock xadd_bulk failing 3 times
-    with patch.object(client, "get_pool", side_effect=redis_exceptions.ConnectionError):
-        # Also need to mock xadd_to_dlq to verify it's called
-        with patch.object(client, "xadd_to_dlq", new_callable=AsyncMock) as mock_dlq:
-            with pytest.raises(ConnectionError):
-                await client.xadd_bulk("test_stream", [{"a": 1}])
+    # Strategy: Mock get_pool to fail
+    client.get_pool = AsyncMock(side_effect=redis_exceptions.ConnectionError)
 
-            mock_dlq.assert_awaited()
+    # Mock xadd_to_dlq
+    client.xadd_to_dlq = AsyncMock()
+
+    # Mock sleep to speed up test
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(ConnectionError):
+            await client.xadd_bulk("test_stream", [{"a": 1}])
+
+        # Should have tried to send to DLQ before raising
+        client.xadd_to_dlq.assert_awaited()
 
 
 @pytest.mark.asyncio
 async def test_read_stream_messages(client):
     mock_pool = AsyncMock()
     client.pool = mock_pool
+    client.get_pool = AsyncMock(return_value=mock_pool)
 
     # Mock XREADGROUP response
-    # Structure: [[stream_name, [[msg_id, {data}]]]]
     mock_response = [[b"test_stream", [[b"1-0", {b"data": b"{}"}]]]]
     mock_pool.xreadgroup.return_value = mock_response
 
@@ -91,6 +104,7 @@ async def test_read_stream_messages(client):
 async def test_ensure_consumer_group(client):
     mock_pool = AsyncMock()
     client.pool = mock_pool
+    client.get_pool = AsyncMock(return_value=mock_pool)
 
     await client.ensure_consumer_group("s1", "g1")
     mock_pool.xgroup_create.assert_awaited()
@@ -104,6 +118,7 @@ async def test_ensure_consumer_group(client):
 async def test_system_state(client):
     mock_pool = AsyncMock()
     client.pool = mock_pool
+    client.get_pool = AsyncMock(return_value=mock_pool)
 
     mock_pool.get.return_value = b"ACTIVE"
     state = await client.get_system_state()
