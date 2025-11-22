@@ -65,12 +65,6 @@ jobs:
             --cov-report=xml \
             --cov-fail-under=90 # Enforces the 95% coverage requirement from Epic 1.1
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }} # Repository secret for Codecov.io
-          file: ./coverage.xml
-          fail_ci_if_error: true
 
   publish:
     name: Publish to GitHub Packages
