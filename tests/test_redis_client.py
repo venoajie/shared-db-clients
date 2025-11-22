@@ -276,3 +276,16 @@ async def test_deep_exception_coverage(client):
     # 3. Get Ticker generic exception (Line 403)
     mock_pool.hget.side_effect = Exception("Boom")
     assert await client.get_ticker_data("inst") is None
+
+
+@pytest.mark.asyncio
+async def test_safe_close_pool_error(client):
+    """Test that exception during pool.close() is logged and ignored."""
+    mock_pool = MagicMock()
+    # close is async
+    mock_pool.close = AsyncMock(side_effect=Exception("Close Error"))
+    client.pool = mock_pool
+
+    # Should not raise
+    await client._safe_close_pool()
+    assert client.pool is None
