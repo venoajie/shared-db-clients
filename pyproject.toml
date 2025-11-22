@@ -48,9 +48,9 @@ dev = [
 ]
 
 [tool.semantic_release]
-version_toml = "pyproject.toml:project.version"
+version_toml = ["pyproject.toml:project.version"]
 build_command = "python -m build"
-commit_parser = "angular"
+commit_parser = "conventional"
 changelog_file = "CHANGELOG.md"
 repository = "github"
 branch = "main"
