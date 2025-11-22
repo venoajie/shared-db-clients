@@ -289,3 +289,72 @@ async def test_safe_close_pool_error(client):
     # Should not raise
     await client._safe_close_pool()
     assert client.pool is None
+
+
+@pytest.mark.asyncio
+async def test_get_pool_stale_and_fail_coverage(client):
+    """
+    Targets:
+    - Line 34: Stale pool (ping fails) -> _safe_close_pool
+    - Line 43: Connect failure -> _safe_close_pool
+    """
+    # 1. Setup Stale Pool logic
+    mock_stale = MagicMock()
+    # ping raises Timeout (triggering Line 32-34)
+    mock_stale.ping = AsyncMock(side_effect=TimeoutError("Timeout"))
+    mock_stale.close = AsyncMock()
+    client.pool = mock_stale
+    client._lock = AsyncMock()  # Mock the lock
+
+    # 2. Setup Connect Failure logic (triggering Line 43)
+    # When we try to recreate, let's fail once then succeed
+    mock_good = MagicMock()
+    mock_good.ping = AsyncMock(return_value=True)
+
+    with patch(
+        "redis.asyncio.from_url",
+        side_effect=[
+            Exception("Connect Fail"),  # Attempt 1 fails (Hits Line 43)
+            mock_good,  # Attempt 2 succeeds
+        ],
+    ):
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            pool = await client.get_pool()
+
+    # Verify Stale pool was closed
+    mock_stale.close.assert_awaited()
+    # Verify we got the good pool eventually
+    assert pool is mock_good
+
+
+@pytest.mark.asyncio
+async def test_deep_exceptions_redis(client):
+    """
+    Targets specific exception blocks in:
+    - xadd_bulk (Lines 180-184)
+    - dequeue_ohlc_work (Lines 359-361)
+    - get_ohlc_work_queue_size (Lines 371-373)
+    """
+    mock_pool = AsyncMock()
+    client.get_pool = AsyncMock(return_value=mock_pool)
+
+    # 1. xadd_bulk exception (Chunk failure)
+    # We need to fail xadd, but not fatally enough to hit DLQ immediately if we want to hit the log warning
+    # Actually, xadd_bulk retries 3 times. We want to hit the "except" block inside the loop.
+    client._write_sem = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(side_effect=redis_exceptions.ConnectionError("Fail"))
+    mock_pool.pipeline.return_value = mock_pipe
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        # This will raise eventually, but we just want to ensure the lines ran
+        with pytest.raises(ConnectionError):
+            await client.xadd_bulk("s", [{"id": 1}])
+
+    # 2. dequeue_ohlc_work exception
+    mock_pool.brpop.side_effect = Exception("Generic Fail")
+    assert await client.dequeue_ohlc_work() is None
+
+    # 3. get_ohlc_work_queue_size exception
+    mock_pool.llen.side_effect = Exception("Generic Fail")
+    assert await client.get_ohlc_work_queue_size() == 0

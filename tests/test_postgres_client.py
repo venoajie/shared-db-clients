@@ -415,3 +415,74 @@ async def test_utilities(client, mock_pool_and_conn):
     await client.insert_account_information("u1", {})
     mock_conn.execute.assert_called()
     assert client._parse_resolution_to_timedelta("1 minute") == timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_start_pool_loop_coverage(mock_pg_config):
+    """
+    Forces execution of the retry loop and exception logging (Lines 97-115).
+    Simulates: Fail, Fail, Success.
+    """
+    client = PostgresClient(config=mock_pg_config)
+
+    # Success Future
+    mock_pool = AsyncMock()
+    mock_pool._closed = False
+    f_success = asyncio.Future()
+    f_success.set_result(mock_pool)
+
+    # We need side_effect to raise exception twice, then return the future
+    with patch(
+        "asyncpg.create_pool",
+        side_effect=[Exception("Fail 1"), Exception("Fail 2"), f_success],
+    ) as mock_create:
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            pool = await client.start_pool()
+
+    assert pool is mock_pool
+    assert mock_create.call_count == 3
+    assert mock_sleep.call_count == 2  # Slept twice
+
+
+@pytest.mark.asyncio
+async def test_bulk_upsert_instruments_timestamps_coverage(client, mock_pool_and_conn):
+    """
+    Directly targets Lines 228-229 (ISO parsing) by calling the method
+    with data that triggers the parsing logic.
+    """
+    _, mock_conn = mock_pool_and_conn
+
+    # Data with ISO string
+    inst_iso = {
+        "exchange": "binance",
+        "instrument_name": "ISO",
+        "expiration_timestamp": "2025-01-01T12:00:00",
+    }
+    # Data with None
+    inst_none = {
+        "exchange": "binance",
+        "instrument_name": "NONE",
+        "expiration_timestamp": None,
+    }
+
+    await client.bulk_upsert_instruments([inst_iso, inst_none], "binance")
+
+    # Extract arguments passed to DB
+    call_args = mock_conn.executemany.call_args[0][1]
+
+    # Verify ISO parsed to datetime
+    assert isinstance(call_args[0][10], datetime)
+    # Verify None stays None
+    assert call_args[1][10] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_public_trade_timestamp_exception(
+    client, mock_pool_and_conn
+):
+    """Targets Lines 541-543 (Exception handling)."""
+    _, mock_conn = mock_pool_and_conn
+    mock_conn.fetchval.side_effect = Exception("DB Error")
+
+    res = await client.fetch_latest_public_trade_timestamp("ex", "inst")
+    assert res is None
