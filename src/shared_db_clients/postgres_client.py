@@ -16,7 +16,6 @@ class PostgresClient:
     def __init__(self, config: PostgresSettings | None = None):
         """
         Initializes the PostgresClient.
-        
         Args:
             config: Optional PostgresSettings object. If None, falls back to the global 'settings.postgres'.
                     This allows for Dependency Injection during testing.
