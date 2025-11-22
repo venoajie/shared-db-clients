@@ -7,19 +7,34 @@ from loguru import logger as log
 from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime, timezone, timedelta
 
-from shared_config.config import settings
+from shared_config.config import settings, PostgresSettings
 
 
 class PostgresClient:
     _pool: asyncpg.Pool = None
 
-    def __init__(self):
-        self.postgres_settings = settings.postgres
-        if not self.postgres_settings:
-            raise ValueError("PostgreSQL settings not configured for this service.")
-        self.dsn = self.postgres_settings.dsn
+    def __init__(self, config: Optional[PostgresSettings] = None):
+        """
+        Initializes the PostgresClient.
+        
+        Args:
+            config: Optional PostgresSettings object. If None, falls back to the global 'settings.postgres'.
+                    This allows for Dependency Injection during testing.
+        """
+        self.postgres_settings = config or settings.postgres
+        
+        # Lazy validation: We don't raise an error immediately if config is missing,
+        # to allow partial usage of shared-db-clients (e.g. Redis-only consumers).
+        # We only check self.dsn when start_pool() is called.
+        if self.postgres_settings:
+            self.dsn = self.postgres_settings.dsn
+        else:
+            self.dsn = None
 
     async def start_pool(self) -> asyncpg.Pool:
+        if not self.dsn:
+            raise ValueError("Cannot start PostgreSQL pool: No PostgreSQL configuration found.")
+
         if self._pool is None or self._pool._closed:
             log.info("PostgreSQL connection pool is not available. Creating new pool.")
             for attempt in range(5):
@@ -35,7 +50,7 @@ class PostgresClient:
                         },
                     )
                     log.info(
-                        f"PostgreSQL pool created successfully with DSN: {self.dsn}"
+                        f"PostgreSQL pool created successfully."
                     )
                     return self._pool
                 except Exception as e:
