@@ -148,7 +148,11 @@ class CustomRedisClient:
                         await pipe.execute()
                         break
 
-                except (TimeoutError, redis_exceptions.ConnectionError, redis_exceptions.ResponseError) as e:
+                except (
+                    TimeoutError,
+                    redis_exceptions.ConnectionError,
+                    redis_exceptions.ResponseError,
+                ) as e:
                     log.warning(
                         f"Failed to send chunk to Redis (attempt {attempt + 1}/3): {e}"
                     )
