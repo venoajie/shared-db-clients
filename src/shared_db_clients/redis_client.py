@@ -4,12 +4,11 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import orjson
 import redis.asyncio as aioredis
 from redis import exceptions as redis_exceptions
-
 from shared_config.config import settings
 
 log = logging.getLogger(__name__)
@@ -33,7 +32,7 @@ class CustomRedisClient:
                 try:
                     await asyncio.wait_for(self.pool.ping(), timeout=0.5)
                     return self.pool
-                except (asyncio.TimeoutError, redis_exceptions.ConnectionError):
+                except (TimeoutError, redis_exceptions.ConnectionError):
                     log.warning("Existing Redis pool is stale. Reconnecting.")
                     await self._safe_close_pool()
 
@@ -60,7 +59,7 @@ class CustomRedisClient:
                     log.info("Redis connection established")
                     return self.pool
                 except Exception as e:
-                    log.warning(f"Connection failed on attempt {attempt+1}: {e}")
+                    log.warning(f"Connection failed on attempt {attempt + 1}: {e}")
                     await self._safe_close_pool()
                     if attempt < 4:
                         await asyncio.sleep(2**attempt)
@@ -83,7 +82,7 @@ class CustomRedisClient:
                 self.pool = None
 
     @staticmethod
-    def parse_stream_message(message_data: Dict[bytes, bytes]) -> dict:
+    def parse_stream_message(message_data: dict[bytes, bytes]) -> dict:
         """
         Correctly parse Redis stream message.
         Optimized to check for known JSON keys first to avoid exception overhead.
@@ -115,7 +114,7 @@ class CustomRedisClient:
     async def xadd_bulk(
         self,
         stream_name: str,
-        messages: Union[List[dict], deque],
+        messages: list[dict] | deque,
         maxlen: int = 10000,
     ) -> None:
         if not messages:
@@ -149,13 +148,9 @@ class CustomRedisClient:
                         await pipe.execute()
                         break
 
-                except (
-                    redis_exceptions.ConnectionError,
-                    asyncio.TimeoutError,
-                    redis_exceptions.ResponseError,
-                ) as e:
+                except (TimeoutError, redis_exceptions.ConnectionError, redis_exceptions.ResponseError) as e:
                     log.warning(
-                        f"Failed to send chunk to Redis (attempt {attempt+1}/3): {e}"
+                        f"Failed to send chunk to Redis (attempt {attempt + 1}/3): {e}"
                     )
                     if attempt == 2:
                         log.error(
@@ -170,9 +165,8 @@ class CustomRedisClient:
     async def xadd_to_dlq(
         self,
         original_stream_name: str,
-        failed_messages: List[dict],
+        failed_messages: list[dict],
     ):
-
         if not failed_messages:
             return
 
@@ -251,7 +245,6 @@ class CustomRedisClient:
         group_name: str,
         *message_ids: str,
     ) -> None:
-
         if not message_ids:
             return
         pool = await self.get_pool()
@@ -286,7 +279,7 @@ class CustomRedisClient:
     async def get_ticker_data(
         self,
         instrument_name: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """
         Retrieves the full ticker data object for a given instrument from Redis.
         """
@@ -297,7 +290,7 @@ class CustomRedisClient:
             if payload:
                 return orjson.loads(payload)
             return None
-        except (redis_exceptions.ConnectionError, asyncio.TimeoutError) as e:
+        except (TimeoutError, redis_exceptions.ConnectionError) as e:
             log.error(
                 f"Failed to get ticker data for '{instrument_name}' from Redis: {e}"
             )
@@ -329,7 +322,7 @@ class CustomRedisClient:
     async def set_system_state(
         self,
         state: str,
-        reason: Optional[str] = None,
+        reason: str | None = None,
     ):
         """
         Sets the global system state.
@@ -365,7 +358,7 @@ class CustomRedisClient:
 
     async def enqueue_ohlc_work(
         self,
-        work_item: Dict[str, Any],
+        work_item: dict[str, Any],
     ):
         """Adds a new OHLC backfill task to the left of the list (queue)."""
         try:
@@ -377,7 +370,7 @@ class CustomRedisClient:
 
     async def enqueue_failed_ohlc_work(
         self,
-        work_item: Dict[str, Any],
+        work_item: dict[str, Any],
     ):
         """Adds a failed OHLC backfill task to the DLQ."""
         try:
@@ -389,7 +382,7 @@ class CustomRedisClient:
                 f"CRITICAL: Failed to enqueue to DLQ. Item lost: {work_item}. Error: {e}"
             )
 
-    async def dequeue_ohlc_work(self) -> Optional[Dict[str, Any]]:
+    async def dequeue_ohlc_work(self) -> dict[str, Any] | None:
         """
         Atomically retrieves and removes a task from the right of the list (queue).
         Uses a blocking pop with a timeout to be efficient.
@@ -400,7 +393,7 @@ class CustomRedisClient:
             if result:
                 return orjson.loads(result[1])
             return None
-        except (redis_exceptions.ConnectionError, asyncio.TimeoutError):
+        except (TimeoutError, redis_exceptions.ConnectionError):
             log.warning("Redis connection issue during dequeue, returning None.")
             return None
         except Exception as e:
