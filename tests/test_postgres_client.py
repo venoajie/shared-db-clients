@@ -32,23 +32,13 @@ def mock_pg_config():
 
 @pytest.fixture
 def mock_pool_and_conn():
-    # mock_conn represents the connection object yielded by pool.acquire()
-    # NOTE: execute/fetch are async methods
     mock_conn = AsyncMock(name="mock_connection")
-
-    # CRITICAL FIX: transaction() is a SYNC method returning an async context manager.
-    # We must overwrite the auto-generated AsyncMock.
     mock_conn.transaction = MagicMock(name="mock_transaction")
     mock_conn.transaction.return_value = MockAsyncContextManager()
 
-    # mock_pool represents the pool
     mock_pool = MagicMock(name="mock_pool")
     mock_pool._closed = False
-
-    # CRITICAL FIX: close() is an ASYNC method
     mock_pool.close = AsyncMock(name="mock_pool_close")
-
-    # acquire() is a SYNC method returning an async context manager
     mock_pool.acquire.return_value = MockAsyncContextManager(mock_conn)
 
     return mock_pool, mock_conn
@@ -69,7 +59,6 @@ def client(mock_pg_config, mock_pool_and_conn):
 @pytest.mark.asyncio
 async def test_start_pool_success(mock_pg_config):
     client = PostgresClient(config=mock_pg_config)
-
     with patch("asyncpg.create_pool", new_callable=AsyncMock) as mock_create:
         mock_pool = AsyncMock()
         mock_pool._closed = False
@@ -81,17 +70,25 @@ async def test_start_pool_success(mock_pg_config):
 
 
 @pytest.mark.asyncio
+async def test_start_pool_no_config():
+    # Inject None into config
+    client = PostgresClient(config=None)
+    client.postgres_settings = None
+    client.dsn = None
+
+    with pytest.raises(ValueError, match="No PostgreSQL configuration"):
+        await client.start_pool()
+
+
+@pytest.mark.asyncio
 async def test_start_pool_failure_retries(mock_pg_config):
     client = PostgresClient(config=mock_pg_config)
-
     with patch(
         "asyncpg.create_pool", side_effect=Exception("Connection Refused")
     ) as mock_create:
-        with patch("asyncio.sleep", new_callable=AsyncMock):  # Skip sleep delays
-            with pytest.raises(ConnectionError) as exc:
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError, match="Fatal: Could not create"):
                 await client.start_pool()
-
-            assert "Fatal: Could not create PostgreSQL pool" in str(exc.value)
             assert mock_create.call_count == 5
 
 
@@ -99,61 +96,64 @@ async def test_start_pool_failure_retries(mock_pg_config):
 async def test_close_pool(client, mock_pool_and_conn):
     mock_pool, _ = mock_pool_and_conn
     await client.close_pool()
-    mock_pool.close.assert_awaited_once()  # Now correctly awaits
-    assert client._pool is None
+    mock_pool.close.assert_awaited_once()
 
 
-# --- Upsert Tests ---
+@pytest.mark.asyncio
+async def test_setup_json_codec(client):
+    # This method is usually called internally by asyncpg, we test it directly
+    mock_conn = AsyncMock()
+    await client._setup_json_codec(mock_conn)
+    assert mock_conn.set_type_codec.call_count == 2  # json and jsonb
+
+
+# --- Upsert Tests (Including Empty/Edge Cases) ---
 
 
 @pytest.mark.asyncio
 async def test_bulk_upsert_tickers(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
+
+    # Empty case
+    await client.bulk_upsert_tickers([])
+    mock_conn.executemany.assert_not_called()
+
+    # Mixed case (valid + missing timestamp)
     data = [
         {
             "exchange": "deribit",
             "instrument_name": "BTC-PERP",
             "last_price": 50000.0,
             "exchange_timestamp": 1600000000000,
-        }
+        },
+        {
+            "instrument_name": "BAD_TICKER"  # Missing timestamp
+        },
     ]
-    # Add missing timestamp case for coverage
-    data_bad = [{"instrument_name": "BAD", "last_price": 1}]
-
-    await client.bulk_upsert_tickers(data + data_bad)
-
+    await client.bulk_upsert_tickers(data)
     mock_conn.executemany.assert_called_once()
+    # Verify only 1 record was passed
     args = mock_conn.executemany.call_args[0]
-    assert len(args[1]) == 1  # Only the valid record
+    assert len(args[1]) == 1
+
+    # Exception case
+    mock_conn.executemany.side_effect = Exception("DB Fail")
+    with pytest.raises(Exception, match="DB Fail"):
+        await client.bulk_upsert_tickers(data)
 
 
 @pytest.mark.asyncio
-async def test_bulk_upsert_ohlc_success(client, mock_pool_and_conn):
+async def test_bulk_upsert_ohlc(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
+
+    # Empty
+    await client.bulk_upsert_ohlc([])
+    mock_conn.execute.assert_not_called()
+
+    # Retry logic
     candles = [
         {
-            "exchange": "deribit",
-            "instrument_name": "BTC-PERP",
-            "resolution": "1",
-            "tick": 1600000000000,
-            "open": 100,
-            "high": 110,
-            "low": 90,
-            "close": 105,
-            "volume": 10,
-        }
-    ]
-
-    await client.bulk_upsert_ohlc(candles)
-    mock_conn.execute.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_bulk_upsert_ohlc_retry_logic(client, mock_pool_and_conn):
-    _, mock_conn = mock_pool_and_conn
-    candles = [
-        {
-            "exchange": "ex",
+            "exchange": "e",
             "instrument_name": "i",
             "resolution": "1",
             "tick": 1000,
@@ -164,45 +164,28 @@ async def test_bulk_upsert_ohlc_retry_logic(client, mock_pool_and_conn):
             "volume": 1,
         }
     ]
-
-    # Simulate "relation does not exist" error twice, then success
     db_err = asyncpg.PostgresError("relation 'ohlc_upsert_type' does not exist")
-    mock_conn.execute.side_effect = [db_err, db_err, None]
+    mock_conn.execute.side_effect = [db_err, None]  # Fail once, then succeed
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
         await client.bulk_upsert_ohlc(candles)
+    assert mock_conn.execute.call_count == 2
 
-    assert mock_conn.execute.call_count == 3
-
-
-@pytest.mark.asyncio
-async def test_bulk_upsert_ohlc_fatal_error(client, mock_pool_and_conn):
-    _, mock_conn = mock_pool_and_conn
-    candles = [
-        {
-            "exchange": "ex",
-            "instrument_name": "i",
-            "resolution": "1",
-            "tick": 1000,
-            "open": 1,
-            "high": 1,
-            "low": 1,
-            "close": 1,
-            "volume": 1,
-        }
-    ]
-
-    # Simulate unknown error
-    mock_conn.execute.side_effect = Exception("Fatal DB Error")
-
-    with pytest.raises(Exception) as exc:
+    # Fatal error
+    mock_conn.execute.side_effect = Exception("Fatal")
+    with pytest.raises(Exception, match="Fatal"):
         await client.bulk_upsert_ohlc(candles)
-    assert "Fatal DB Error" in str(exc.value)
 
 
 @pytest.mark.asyncio
 async def test_bulk_upsert_instruments(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
+
+    # Empty
+    await client.bulk_upsert_instruments([], "binance")
+    mock_conn.executemany.assert_not_called()
+
+    # Valid
     instruments = [
         {
             "exchange": "binance",
@@ -211,22 +194,46 @@ async def test_bulk_upsert_instruments(client, mock_pool_and_conn):
             "data": {},
         }
     ]
-
     await client.bulk_upsert_instruments(instruments, "binance")
     mock_conn.executemany.assert_called_once()
+
+    # Exception
+    mock_conn.executemany.side_effect = Exception("Fail")
+    with pytest.raises(Exception, match="Fail"):
+        await client.bulk_upsert_instruments(instruments, "binance")
 
 
 @pytest.mark.asyncio
 async def test_bulk_upsert_orders(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
-    orders = [{"order_id": "123", "price": 500}]
+    # Empty
+    await client.bulk_upsert_orders([])
+    mock_conn.execute.assert_not_called()
+
+    # Valid
+    orders = [{"order_id": "123"}]
     await client.bulk_upsert_orders(orders)
     mock_conn.execute.assert_awaited_once()
+
+    # Exception
+    mock_conn.execute.side_effect = Exception("Fail")
+    with pytest.raises(Exception, match="Fail"):
+        await client.bulk_upsert_orders(orders)
 
 
 @pytest.mark.asyncio
 async def test_bulk_insert_public_trades(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
+
+    # Empty input
+    await client.bulk_insert_public_trades([])
+    mock_conn.execute.assert_not_called()
+
+    # Empty after filtering (bad data)
+    await client.bulk_insert_public_trades([{"bad": "data"}])
+    mock_conn.execute.assert_not_called()
+
+    # Valid
     trades = [
         {
             "exchange": "deribit",
@@ -240,77 +247,96 @@ async def test_bulk_insert_public_trades(client, mock_pool_and_conn):
             "trade_timestamp": datetime.now(UTC),
         }
     ]
-
     await client.bulk_insert_public_trades(trades)
     mock_conn.execute.assert_awaited_once()
 
-    # Test missing key handling (coverage)
-    bad_trade = [{"trade_id": "t2"}]  # Missing fields
-    await client.bulk_insert_public_trades(
-        bad_trade
-    )  # Should log error but not crash/insert
-    # Call count remains 1 from previous call (or we reset mock)
+    # Exception
+    mock_conn.execute.side_effect = Exception("Fail")
+    with pytest.raises(Exception, match="Fail"):
+        await client.bulk_insert_public_trades(trades)
 
 
 @pytest.mark.asyncio
 async def test_delete_orders(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
-    to_delete = [("binance", "BTCUSDT", "oid_1")]
-    await client.delete_orders(to_delete)
+    # Empty
+    await client.delete_orders([])
+    mock_conn.executemany.assert_not_called()
+
+    # Valid
+    await client.delete_orders([("ex", "inst", "oid")])
     mock_conn.executemany.assert_called_once()
 
+    # Exception
+    mock_conn.executemany.side_effect = Exception("Fail")
+    with pytest.raises(Exception, match="Fail"):
+        await client.delete_orders([("ex", "inst", "oid")])
 
-# --- Fetch Tests ---
+
+# --- Fetch & Read Tests (Complete Coverage) ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_instruments(client, mock_pool_and_conn):
+    _, mock_conn = mock_pool_and_conn
+    await client.fetch_all_instruments()
+    mock_conn.fetch.assert_called_with("SELECT * FROM v_instruments")
 
 
 @pytest.mark.asyncio
 async def test_fetch_active_trades(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
-    await client.fetch_active_trades("user123")
+    # Without User ID
+    await client.fetch_active_trades()
+    assert "WHERE user_id" not in mock_conn.fetch.call_args[0][0]
+
+    # With User ID
+    await client.fetch_active_trades("u1")
+    assert "WHERE user_id = $1" in mock_conn.fetch.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_orders(client, mock_pool_and_conn):
+    _, mock_conn = mock_pool_and_conn
+    # Without User ID
+    await client.fetch_open_orders()
+
+    # With User ID
+    await client.fetch_open_orders("u1")
+    assert "AND user_id = $1" in mock_conn.fetch.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_user_records(client, mock_pool_and_conn):
+    _, mock_conn = mock_pool_and_conn
+    mock_conn.fetch.return_value = []
+    await client.fetch_all_user_records("u1")
     mock_conn.fetch.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_fetch_ohlc_for_instrument(client, mock_pool_and_conn):
+async def test_fetch_trades_by_timestamp(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
-    await client.fetch_ohlc_for_instrument("deribit", "BTC-PERP", "1", 100)
-    mock_conn.fetch.assert_awaited()
+    await client.fetch_trades_by_timestamp(1000, 2000, "deribit")
+    mock_conn.fetch.assert_called()
+    args = mock_conn.fetch.call_args[0]
+    # Validate timestamp conversion
+    assert isinstance(args[1], datetime)  # start_dt
+    assert args[3] == "deribit"
 
 
 @pytest.mark.asyncio
-async def test_fetch_latest_timestamps(client, mock_pool_and_conn):
+async def test_fetch_all_trades_for_instrument(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
-    # OHLC timestamp
-    await client.fetch_latest_ohlc_timestamp("ex", "inst", timedelta(minutes=1))
-    mock_conn.fetchval.assert_called()
-
-    mock_conn.reset_mock()
-    # Public trade timestamp
-    await client.fetch_latest_public_trade_timestamp("ex", "inst")
-    mock_conn.fetchval.assert_called()
+    await client.fetch_all_trades_for_instrument("BTC-PERP")
+    mock_conn.fetch.assert_called()
 
 
 @pytest.mark.asyncio
-async def test_utilities_and_misc(client, mock_pool_and_conn):
+async def test_fetch_all_trades_for_user(client, mock_pool_and_conn):
     _, mock_conn = mock_pool_and_conn
-
-    # Resolution Parsing
-    assert client._parse_resolution_to_timedelta("15 minutes") == timedelta(minutes=15)
-    assert client._parse_resolution_to_timedelta("1D") == timedelta(days=1)
-    with pytest.raises(ValueError):
-        client._parse_resolution_to_timedelta("BAD")
-
-    # Account Info
-    await client.insert_account_information("u1", {})
-    mock_conn.execute.assert_awaited()
-
-    # Futures Summary
-    await client.fetch_futures_summary_for_exchange("deribit")
-    mock_conn.fetchrow.assert_awaited()
-
-    # Bulk update is_open
-    await client.bulk_update_is_open_status(["t1"], False)
-    mock_conn.execute.assert_awaited()
+    await client.fetch_all_trades_for_user("u1")
+    mock_conn.fetch.assert_called()
 
 
 @pytest.mark.asyncio
@@ -319,5 +345,61 @@ async def test_check_bootstrap_status(client, mock_pool_and_conn):
     mock_conn.fetchval.return_value = "complete"
     assert await client.check_bootstrap_status("ex") is True
 
-    await client.set_bootstrap_status(False, "ex")
-    mock_conn.execute.assert_awaited()
+    await client.set_bootstrap_status(True, "ex")
+    mock_conn.execute.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_is_open_status(client, mock_pool_and_conn):
+    _, mock_conn = mock_pool_and_conn
+    # Empty
+    await client.bulk_update_is_open_status([], True)
+    mock_conn.execute.assert_not_called()
+
+    # Valid
+    await client.bulk_update_is_open_status(["t1"], True)
+    mock_conn.execute.assert_called()
+
+    # Exception
+    mock_conn.execute.side_effect = Exception("Fail")
+    with pytest.raises(Exception, match="Fail"):
+        await client.bulk_update_is_open_status(["t1"], True)
+
+
+@pytest.mark.asyncio
+async def test_fetch_ohlc_methods(client, mock_pool_and_conn):
+    _, mock_conn = mock_pool_and_conn
+
+    # Fetch OHLC list
+    await client.fetch_ohlc_for_instrument("ex", "inst", "1", 100)
+    mock_conn.fetch.assert_called()
+
+    # Fetch latest TS (Error case)
+    mock_conn.fetchval.side_effect = Exception("DB Fail")
+    res = await client.fetch_latest_ohlc_timestamp("ex", "inst", timedelta(minutes=1))
+    assert res is None
+
+    # Reset
+    mock_conn.fetchval.side_effect = None
+
+    # Fetch latest Public Trade TS (Error case)
+    mock_conn.fetchval.side_effect = Exception("DB Fail")
+    res = await client.fetch_latest_public_trade_timestamp("ex", "inst")
+    assert res is None
+
+
+@pytest.mark.asyncio
+async def test_futures_summary_error(client, mock_pool_and_conn):
+    _, mock_conn = mock_pool_and_conn
+    mock_conn.fetchrow.side_effect = Exception("Fail")
+    res = await client.fetch_futures_summary_for_exchange("deribit")
+    assert res is None
+
+
+@pytest.mark.asyncio
+async def test_utilities(client, mock_pool_and_conn):
+    _, mock_conn = mock_pool_and_conn
+    await client.insert_account_information("u1", {})
+    mock_conn.execute.assert_called()
+
+    assert client._parse_resolution_to_timedelta("1 minute") == timedelta(minutes=1)

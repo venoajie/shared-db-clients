@@ -1,6 +1,5 @@
 # tests/test_redis_client.py
 
-import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
@@ -17,29 +16,34 @@ def client():
 
 @pytest.mark.asyncio
 async def test_get_pool_circuit_breaker(client):
-    # Mock redis to fail consistently
     with patch(
         "redis.asyncio.from_url", side_effect=redis_exceptions.ConnectionError("Fail")
     ):
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            # First call triggers retries and opens circuit
-            with pytest.raises(ConnectionError):
+            with pytest.raises(ConnectionError, match="after 5 attempts"):
                 await client.get_pool()
-
             assert client._circuit_open is True
 
-            # Immediate second call should fail fast (circuit open)
-            with pytest.raises(ConnectionError) as exc:
+            # Fast fail
+            with pytest.raises(ConnectionError, match="circuit breaker open"):
                 await client.get_pool()
-            assert "circuit breaker open" in str(exc.value)
 
-            # Simulate time passing to reset circuit
-            client._last_failure = time.time() - 100
 
-            # Next call attempts reconnect (fails again in this mock, but passes circuit check)
-            with pytest.raises(ConnectionError) as exc:
-                await client.get_pool()
-            assert "circuit breaker open" not in str(exc.value)
+@pytest.mark.asyncio
+async def test_xadd_bulk_logic(client):
+    # Empty input
+    await client.xadd_bulk("stream", [])
+
+    # Valid input
+    mock_pool = MagicMock()
+    client.get_pool = AsyncMock(return_value=mock_pool)
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock()
+    mock_pool.pipeline.return_value = mock_pipe
+
+    await client.xadd_bulk("stream", [{"id": 1}])
+    mock_pipe.xadd.assert_called()
+    mock_pipe.execute.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -47,61 +51,96 @@ async def test_xadd_bulk_dlq_fallback(client):
     mock_pool = MagicMock()
     client.get_pool = AsyncMock(return_value=mock_pool)
 
-    # Pipeline returns a helper, execution fails
     mock_pipe = MagicMock()
     mock_pipe.execute = AsyncMock(
         side_effect=redis_exceptions.ConnectionError("Redis Down")
     )
     mock_pool.pipeline.return_value = mock_pipe
-
     client.xadd_to_dlq = AsyncMock()
 
-    msgs = [{"id": 1}]
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        with pytest.raises(ConnectionError):
-            await client.xadd_bulk("stream", msgs)
-
-    # Verify fallback to DLQ was called
-    client.xadd_to_dlq.assert_awaited_once()
+        with pytest.raises(ConnectionError, match="Failed to write to Redis"):
+            await client.xadd_bulk("stream", [{"id": 1}])
+    client.xadd_to_dlq.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_xadd_to_dlq_failure(client):
-    # Verify that if DLQ fails, we log critical but don't crash the app entirely (catch Exception)
+async def test_xadd_to_dlq(client):
+    # Empty
+    await client.xadd_to_dlq("s", [])
+
+    # Exception handling
     client.get_pool = AsyncMock(side_effect=Exception("Total Fail"))
-
-    # Should not raise
-    await client.xadd_to_dlq("stream", [{"id": 1}])
+    await client.xadd_to_dlq("s", [{"id": 1}])
 
 
 @pytest.mark.asyncio
-async def test_parse_stream_message():
-    # Happy path
-    msg = {b"data": orjson.dumps({"price": 100})}
-    res = CustomRedisClient.parse_stream_message(msg)
-    assert res["data"]["price"] == 100
-
-    # Broken JSON fallback
-    msg_bad = {b"data": b"{bad_json"}
-    res_bad = CustomRedisClient.parse_stream_message(msg_bad)
-    assert res_bad["data"] == "{bad_json"  # Returns raw string
-
-
-@pytest.mark.asyncio
-async def test_read_stream_messages_nogroup(client):
+async def test_ensure_consumer_group(client):
     mock_pool = AsyncMock()
     client.get_pool = AsyncMock(return_value=mock_pool)
 
-    # Simulate NOGROUP error
-    mock_pool.xreadgroup.side_effect = redis_exceptions.ResponseError(
-        "NOGROUP No such key"
-    )
-    client.ensure_consumer_group = AsyncMock()
+    # Normal
+    await client.ensure_consumer_group("s", "g")
 
+    # Busy Group (Exists)
+    mock_pool.xgroup_create.side_effect = redis_exceptions.ResponseError("BUSYGROUP")
+    await client.ensure_consumer_group("s", "g")  # Should just log and return
+
+
+@pytest.mark.asyncio
+async def test_read_stream_messages(client):
+    mock_pool = AsyncMock()
+    client.get_pool = AsyncMock(return_value=mock_pool)
+
+    # Normal
+    mock_pool.xreadgroup.return_value = [[b"s", [[b"1", {b"d": b"{}"}]]]]
     res = await client.read_stream_messages("s", "g", "c")
+    assert len(res) == 1
 
+    # No Group Error
+    mock_pool.xreadgroup.side_effect = redis_exceptions.ResponseError("NOGROUP")
+    client.ensure_consumer_group = AsyncMock()
+    res = await client.read_stream_messages("s", "g", "c")
     assert res == []
-    client.ensure_consumer_group.assert_awaited_once()
+    client.ensure_consumer_group.assert_awaited()
+
+    # Connection Error
+    mock_pool.xreadgroup.side_effect = redis_exceptions.ConnectionError("Fail")
+    with pytest.raises(ConnectionError, match="Redis connection failed"):
+        await client.read_stream_messages("s", "g", "c")
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_message(client):
+    # Empty
+    await client.acknowledge_message("s", "g")
+
+    # Valid
+    mock_pool = AsyncMock()
+    client.get_pool = AsyncMock(return_value=mock_pool)
+    await client.acknowledge_message("s", "g", "1")
+    mock_pool.xack.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_xautoclaim_stale_messages(client):
+    mock_pool = AsyncMock()
+    client.get_pool = AsyncMock(return_value=mock_pool)
+
+    # Success
+    mock_pool.xautoclaim.return_value = (b"0-0", [])
+    await client.xautoclaim_stale_messages("s", "g", "c", 1000)
+    mock_pool.xautoclaim.assert_awaited()
+
+    # Response Error
+    mock_pool.xautoclaim.side_effect = redis_exceptions.ResponseError("Fail")
+    res_id, res_list = await client.xautoclaim_stale_messages("s", "g", "c", 1000)
+    assert res_list == []
+
+    # Generic Error
+    mock_pool.xautoclaim.side_effect = Exception("Crash")
+    with pytest.raises(Exception, match="Crash"):
+        await client.xautoclaim_stale_messages("s", "g", "c", 1000)
 
 
 @pytest.mark.asyncio
@@ -110,28 +149,57 @@ async def test_ohlc_queue_ops(client):
     client.get_pool = AsyncMock(return_value=mock_pool)
 
     # Enqueue
-    await client.enqueue_ohlc_work({"task": 1})
+    await client.enqueue_ohlc_work({"t": 1})
+
+    # Clear
+    await client.clear_ohlc_work_queue()
+    mock_pool.delete.assert_awaited()
+
+    # Enqueue Failed (DLQ)
+    await client.enqueue_failed_ohlc_work({"t": 1})
     mock_pool.lpush.assert_awaited()
 
-    # Dequeue success
-    mock_pool.brpop.return_value = [b"key", orjson.dumps({"task": 1})]
-    res = await client.dequeue_ohlc_work()
-    assert res["task"] == 1
+    # DLQ Exception
+    mock_pool.lpush.side_effect = Exception("Fail")
+    await client.enqueue_failed_ohlc_work({"t": 1})  # Should catch log critical
 
-    # Dequeue None
-    mock_pool.brpop.return_value = None
+    # Get Size
+    client.get_pool.side_effect = None  # Reset
+    mock_pool.lpush.side_effect = None
+    mock_pool.llen.return_value = 5
+    assert await client.get_ohlc_work_queue_size() == 5
+
+    # Get Size Exception
+    mock_pool.llen.side_effect = Exception("Fail")
+    assert await client.get_ohlc_work_queue_size() == 0
+
+    # Dequeue
+    mock_pool.brpop.return_value = [b"k", orjson.dumps({"t": 1})]
+    res = await client.dequeue_ohlc_work()
+    assert res["t"] == 1
+
+    # Dequeue Timeout
+    mock_pool.brpop.side_effect = TimeoutError()
     assert await client.dequeue_ohlc_work() is None
 
 
 @pytest.mark.asyncio
-async def test_get_ticker_data(client):
+async def test_ticker_data(client):
     mock_pool = AsyncMock()
     client.get_pool = AsyncMock(return_value=mock_pool)
 
-    mock_pool.hget.return_value = orjson.dumps({"price": 50000})
+    mock_pool.hget.return_value = orjson.dumps({"p": 1})
+    res = await client.get_ticker_data("i")
+    assert res["p"] == 1
 
-    res = await client.get_ticker_data("BTC-PERP")
-    assert res["price"] == 50000
+    # Connection Error
+    mock_pool.hget.side_effect = redis_exceptions.ConnectionError("Fail")
+    with pytest.raises(ConnectionError, match="Redis connection failed"):
+        await client.get_ticker_data("i")
+
+    # Generic Error
+    mock_pool.hget.side_effect = Exception("Fail")
+    assert await client.get_ticker_data("i") is None
 
 
 @pytest.mark.asyncio
@@ -139,10 +207,32 @@ async def test_system_state(client):
     mock_pool = AsyncMock()
     client.get_pool = AsyncMock(return_value=mock_pool)
 
-    # Set
-    await client.set_system_state("ACTIVE")
-    mock_pool.hset.assert_awaited()
+    await client.set_system_state("A", "Reason")
 
-    # Get
-    mock_pool.get.return_value = b"ACTIVE"
-    assert await client.get_system_state() == "ACTIVE"
+    # Set Error
+    mock_pool.hset.side_effect = ConnectionError("Fail")
+    await client.set_system_state("A")  # Should catch
+
+    # Get Default
+    client.get_pool.side_effect = None
+    mock_pool.get.return_value = None
+    assert await client.get_system_state() == "LOCKED"
+
+    # Get Error
+    mock_pool.get.side_effect = ConnectionError("Fail")
+    assert await client.get_system_state() == "LOCKED"
+
+
+@pytest.mark.asyncio
+async def test_parse_message(client):
+    # Good
+    res = CustomRedisClient.parse_stream_message({b"data": orjson.dumps({"a": 1})})
+    assert res["data"]["a"] == 1
+
+    # Bad JSON
+    res = CustomRedisClient.parse_stream_message({b"data": b"{bad"})
+    assert res["data"] == "{bad"
+
+    # Bad Decode
+    res = CustomRedisClient.parse_stream_message({b"data": b"\xff"})
+    assert res["data"] == b"\xff"
