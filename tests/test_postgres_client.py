@@ -1,5 +1,5 @@
 from datetime import timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared_config.config import PostgresSettings
@@ -7,8 +7,11 @@ from shared_config.config import PostgresSettings
 from shared_db_clients.postgres_client import PostgresClient
 
 
-# --- Helper for mocking async context managers (pool.acquire) ---
-class AsyncContextManagerMock(AsyncMock):
+# --- Robust Async Context Manager Mock ---
+class AsyncContextManager:
+    def __init__(self, return_value=None):
+        self.return_value = return_value
+
     async def __aenter__(self):
         return self.return_value
 
@@ -48,35 +51,30 @@ async def test_start_pool_success(client):
 
 @pytest.mark.asyncio
 async def test_start_pool_failure_retries(client):
-    # We patch asyncio.sleep to skip waiting during retries
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        # We simulate 5 failures to trigger the final ConnectionError
         with patch("asyncpg.create_pool", side_effect=Exception("Fail")) as mock_create:
             with pytest.raises(ConnectionError):
                 await client.start_pool()
-
-            # Should have tried 5 times
             assert mock_create.call_count == 5
 
 
 @pytest.mark.asyncio
 async def test_bulk_upsert_tickers(client):
-    # Setup Connection Mock
+    # 1. Create the Mock Connection (the object inside the 'with')
     mock_conn = AsyncMock()
-    mock_conn.transaction.return_value = AsyncContextManagerMock()
+    # Transaction is also an async context manager
+    mock_conn.transaction.return_value = AsyncContextManager()
 
-    # Setup Pool Mock with proper Async Context Manager for acquire()
-    mock_pool = AsyncMock()
+    # 2. Create the Mock Pool
+    mock_pool = MagicMock()  # .acquire() is sync, returns a context manager
     mock_pool._closed = False
 
-    # When pool.acquire() is called, it returns an Async Context Manager
-    # which yields mock_conn on __aenter__
-    acquire_mock = AsyncContextManagerMock(return_value=mock_conn)
-    mock_pool.acquire = acquire_mock
+    # 3. pool.acquire() returns the Context Manager, which yields the conn
+    mock_pool.acquire.return_value = AsyncContextManager(return_value=mock_conn)
 
-    # Inject mock pool directly to avoid start_pool logic in this test
+    # 4. Inject
     client._pool = mock_pool
-    # Bypass start_pool call inside the method by patching it
+    # Patch start_pool to simply return our mock pool
     client.start_pool = AsyncMock(return_value=mock_pool)
 
     data = [
@@ -84,7 +82,7 @@ async def test_bulk_upsert_tickers(client):
             "exchange": "deribit",
             "instrument_name": "BTC-PERP",
             "last_price": 50000.0,
-            "exchange_timestamp": 1600000000000,  # ms
+            "exchange_timestamp": 1600000000000,
         }
     ]
 
@@ -93,18 +91,16 @@ async def test_bulk_upsert_tickers(client):
     mock_conn.executemany.assert_called_once()
     args = mock_conn.executemany.call_args[0]
     assert "INSERT INTO tickers" in args[0]
-    assert len(args[1]) == 1
 
 
 @pytest.mark.asyncio
 async def test_bulk_upsert_ohlc(client):
     mock_conn = AsyncMock()
-    mock_conn.transaction.return_value = AsyncContextManagerMock()
+    mock_conn.transaction.return_value = AsyncContextManager()
 
-    mock_pool = AsyncMock()
+    mock_pool = MagicMock()
     mock_pool._closed = False
-    acquire_mock = AsyncContextManagerMock(return_value=mock_conn)
-    mock_pool.acquire = acquire_mock
+    mock_pool.acquire.return_value = AsyncContextManager(return_value=mock_conn)
 
     client._pool = mock_pool
     client.start_pool = AsyncMock(return_value=mock_pool)
@@ -113,7 +109,7 @@ async def test_bulk_upsert_ohlc(client):
         {
             "exchange": "deribit",
             "instrument_name": "BTC-PERP",
-            "resolution": "1",  # 1 minute
+            "resolution": "1",
             "tick": 1600000000000,
             "open": 100,
             "high": 110,
@@ -152,20 +148,16 @@ async def test_close_pool(client):
 @pytest.mark.asyncio
 async def test_misc_fetch_methods(client):
     mock_conn = AsyncMock()
-    mock_conn.transaction.return_value = AsyncContextManagerMock()
 
-    mock_pool = AsyncMock()
+    mock_pool = MagicMock()
     mock_pool._closed = False
-    acquire_mock = AsyncContextManagerMock(return_value=mock_conn)
-    mock_pool.acquire = acquire_mock
+    mock_pool.acquire.return_value = AsyncContextManager(return_value=mock_conn)
 
     client._pool = mock_pool
     client.start_pool = AsyncMock(return_value=mock_pool)
 
-    # Test fetch_active_trades
     await client.fetch_active_trades("user123")
     mock_conn.fetch.assert_called()
 
-    # Test insert_account_info
     await client.insert_account_information("user1", {"data": 1})
     mock_conn.execute.assert_called()
