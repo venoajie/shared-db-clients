@@ -32,7 +32,9 @@ class PostgresClient:
 
     async def start_pool(self) -> asyncpg.Pool:
         if not self.dsn:
-            raise ValueError("Cannot start PostgreSQL pool: No PostgreSQL configuration found.")
+            raise ValueError(
+                "Cannot start PostgreSQL pool: No PostgreSQL configuration found."
+            )
 
         if self._pool is None or self._pool._closed:
             log.info("PostgreSQL connection pool is not available. Creating new pool.")
@@ -48,13 +50,11 @@ class PostgresClient:
                             "application_name": "trading-system-db-client",
                         },
                     )
-                    log.info(
-                        "PostgreSQL pool created successfully."
-                    )
+                    log.info("PostgreSQL pool created successfully.")
                     return self._pool
                 except Exception as e:
                     log.error(
-                        f"Failed to create PostgreSQL pool (attempt {attempt+1}/5): {e}"
+                        f"Failed to create PostgreSQL pool (attempt {attempt + 1}/5): {e}"
                     )
                     await asyncio.sleep(2**attempt)
             raise ConnectionError(
@@ -72,7 +72,6 @@ class PostgresClient:
         self,
         connection: asyncpg.Connection,
     ):
-
         for json_type in ["jsonb", "json"]:
             await connection.set_type_codec(
                 json_type,
@@ -105,7 +104,6 @@ class PostgresClient:
                 return timedelta(seconds=value)
 
         try:
-
             if resolution.upper().endswith("D"):
                 return timedelta(days=int(resolution[:-1]))
             if resolution.upper().endswith("W"):
@@ -120,7 +118,6 @@ class PostgresClient:
         self,
         candle_data: dict[str, Any],
     ) -> tuple:
-
         tick_dt = datetime.fromtimestamp(candle_data["tick"] / 1000, tz=UTC)
         resolution_str = candle_data["resolution"]
         resolution_td = self._parse_resolution_to_timedelta(resolution_str)
@@ -142,7 +139,6 @@ class PostgresClient:
         self,
         tickers_data: list[dict[str, Any]],
     ):
-
         if not tickers_data:
             return
         query = """
@@ -203,7 +199,6 @@ class PostgresClient:
         self,
         candles: list[dict[str, Any]],
     ):
-
         if not candles:
             return
 
@@ -225,7 +220,7 @@ class PostgresClient:
             except asyncpg.PostgresError as e:
                 if "does not exist" in str(e):
                     log.warning(
-                        f"Database schema not ready (attempt {attempt + 1}/5). Retrying OHLC upsert in {2 ** attempt}s. Error: {e}"
+                        f"Database schema not ready (attempt {attempt + 1}/5). Retrying OHLC upsert in {2**attempt}s. Error: {e}"
                     )
                     await asyncio.sleep(2**attempt)
                     continue
@@ -402,7 +397,6 @@ class PostgresClient:
         self,
         user_id: str = None,
     ) -> list[asyncpg.Record]:
-
         query = "SELECT * FROM v_active_trades"
         params = []
         if user_id:
