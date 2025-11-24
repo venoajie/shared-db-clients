@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
-
+import socket  
 import orjson
 import redis.asyncio as aioredis
 from loguru import logger as log
@@ -56,9 +56,9 @@ class CustomRedisClient:
                         socket_connect_timeout=2,
                         socket_keepalive=True,
                         socket_keepalive_options={
-                            "TCP_KEEPIDLE": 60,
-                            "TCP_KEEPINTVL": 30,
-                            "TCP_KEEPCNT": 5,
+                            socket.TCP_KEEPIDLE: 60,
+                            socket.TCP_KEEPINTVL: 30,
+                            socket.TCP_KEEPCNT: 5,
                         },
                         max_connections=30,
                         encoding="utf-8",
