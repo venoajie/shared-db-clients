@@ -4,7 +4,8 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, Callable, Awaitable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 import orjson
 import redis.asyncio as aioredis
@@ -48,6 +49,16 @@ class CustomRedisClient:
             redis_config = settings.redis
             for attempt in range(5):
                 try:
+                    
+                    
+                    # [START DIAGNOSTIC MODIFICATION]
+                    log.debug(
+                        f"Attempting Redis connection with "
+                        f"db='{redis_config.db}' (type: {type(redis_config.db)})"
+                    )
+                    # [END DIAGNOSTIC MODIFICATION]
+
+
                     self.pool = aioredis.from_url(
                         redis_config.url,
                         password=redis_config.password,
@@ -127,7 +138,7 @@ class CustomRedisClient:
             redis.exceptions.RedisError: For non-recoverable Redis errors
                                          (e.g., syntax errors, wrong key type).
         """
-        
+
         last_exception: Exception | None = None
         for attempt in range(3):  # Total of 3 attempts
             try:
@@ -145,7 +156,7 @@ class CustomRedisClient:
                 last_exception = e
                 if attempt < 2:
                     await asyncio.sleep(0.5 * (2**attempt))
-        
+
         log.error(f"Redis command '{command_name_for_logging}' failed after 3 attempts.")
         raise ConnectionError(
             f"Failed to execute Redis command '{command_name_for_logging}' after retries."
@@ -207,9 +218,9 @@ class CustomRedisClient:
                                 approximate=True,
                             )
                         await pipe.execute()
-                
+
                 await self._execute_resiliently(command, "pipeline.execute(xadd)")
-            
+
             except (ConnectionError, redis_exceptions.ResponseError) as e:
                 log.error(
                     f"Final attempt to send chunk failed. Moving to DLQ stream. Error: {e}"
@@ -228,7 +239,7 @@ class CustomRedisClient:
                 for msg in failed_messages:
                     pipe.xadd(dlq_stream_name, {"payload": orjson.dumps(msg)}, maxlen=25000)
                 await pipe.execute()
-            
+
             await self._execute_resiliently(command, "pipeline.execute(xadd_dlq)")
             log.warning(
                 f"{len(failed_messages)} message(s) moved to DLQ stream '{dlq_stream_name}'"
@@ -268,7 +279,7 @@ class CustomRedisClient:
                         await self.ensure_consumer_group(stream_name, group_name)
                         return []
                     raise
-            
+
             return await self._execute_resiliently(command, "xreadgroup")
         except ConnectionError as e:
             raise ConnectionError("Redis connection failed during XREADGROUP") from e
@@ -327,7 +338,7 @@ class CustomRedisClient:
                 state_data = {"status": state, "reason": reason or "", "timestamp": time.time()}
                 await pool.hset("system:state", mapping=state_data)
                 await pool.set("system:state:simple", state)
-            
+
             await self._execute_resiliently(command, "hset/set")
             log.info(f"System state transitioned to: {state.upper()}" + (f" (Reason: {reason})" if reason else ""))
         except ConnectionError:
