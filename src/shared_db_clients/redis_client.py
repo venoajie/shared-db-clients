@@ -4,13 +4,14 @@
 import asyncio
 import time
 from collections import deque
-from typing import Any, Callable, Awaitable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 import orjson
 import redis.asyncio as aioredis
+from loguru import logger as log  # [FIX] Use loguru for consistent logging
 from redis import exceptions as redis_exceptions
 from shared_config.config import settings
-from loguru import logger as log  # [FIX] Use loguru for consistent logging
 
 T = TypeVar("T")
 
@@ -49,7 +50,9 @@ class CustomRedisClient:
                     self.pool = aioredis.from_url(
                         redis_config.url,
                         password=redis_config.password,
-                        db=int(redis_config.db),  # [FIX] Explicitly cast db to int to resolve TypeError
+                        db=int(
+                            redis_config.db
+                        ),  # [FIX] Explicitly cast db to int to resolve TypeError
                         socket_connect_timeout=2,
                         socket_keepalive=True,
                         socket_keepalive_options={
@@ -93,7 +96,6 @@ class CustomRedisClient:
         func: Callable[[aioredis.Redis], Awaitable[T]],
         command_name_for_logging: str,
     ) -> T:
-        
         """
 
         Executes a given Redis command function with a resilient retry mechanism.
@@ -124,7 +126,7 @@ class CustomRedisClient:
             redis.exceptions.RedisError: For non-recoverable Redis errors
                                          (e.g., syntax errors, wrong key type).
         """
-        
+
         last_exception: Exception | None = None
         for attempt in range(3):
             try:
@@ -142,13 +144,14 @@ class CustomRedisClient:
                 last_exception = e
                 if attempt < 2:
                     await asyncio.sleep(0.5 * (2**attempt))
-        
-        log.error(f"Redis command '{command_name_for_logging}' failed after 3 attempts.")
+
+        log.error(
+            f"Redis command '{command_name_for_logging}' failed after 3 attempts."
+        )
         raise ConnectionError(
             f"Failed to execute Redis command '{command_name_for_logging}' after retries."
         ) from last_exception
-        
-        
+
     @staticmethod
     def parse_stream_message(message_data: dict[bytes, bytes]) -> dict:
         """
@@ -194,10 +197,11 @@ class CustomRedisClient:
         for chunk_start in range(0, len(message_list), CHUNK_SIZE):
             chunk = message_list[chunk_start : chunk_start + CHUNK_SIZE]
             try:
-                async def command(pool: aioredis.Redis):
+
+                async def command(pool: aioredis.Redis, current_chunk=chunk):
                     async with self._write_sem:
                         pipe = pool.pipeline()
-                        for msg in chunk:
+                        for msg in current_chunk:
                             encoded_msg = {
                                 k.encode("utf-8"): (
                                     orjson.dumps(v)
@@ -213,9 +217,9 @@ class CustomRedisClient:
                                 approximate=True,
                             )
                         await pipe.execute()
-                
+
                 await self._execute_resiliently(command, "pipeline.execute(xadd)")
-            
+
             except (ConnectionError, redis_exceptions.ResponseError) as e:
                 log.error(
                     f"Final attempt to send chunk failed. Moving to DLQ stream. Error: {e}"
@@ -235,12 +239,15 @@ class CustomRedisClient:
 
         dlq_stream_name = f"dlq:{original_stream_name}"
         try:
+
             async def command(pool: aioredis.Redis):
                 pipe = pool.pipeline()
                 for msg in failed_messages:
-                    pipe.xadd(dlq_stream_name, {"payload": orjson.dumps(msg)}, maxlen=25000)
+                    pipe.xadd(
+                        dlq_stream_name, {"payload": orjson.dumps(msg)}, maxlen=25000
+                    )
                 await pipe.execute()
-            
+
             await self._execute_resiliently(command, "pipeline.execute(xadd_dlq)")
             log.warning(
                 f"{len(failed_messages)} message(s) moved to DLQ stream "
@@ -264,7 +271,7 @@ class CustomRedisClient:
                     id="0",
                     mkstream=True,
                 ),
-                "xgroup_create"
+                "xgroup_create",
             )
 
             log.info(
@@ -285,6 +292,7 @@ class CustomRedisClient:
         block: int = 2000,
     ) -> list:
         try:
+
             async def command(pool: aioredis.Redis):
                 try:
                     response = await pool.xreadgroup(
@@ -304,6 +312,7 @@ class CustomRedisClient:
                         await self.ensure_consumer_group(stream_name, group_name)
                         return []
                     raise
+
             return await self._execute_resiliently(command, "xreadgroup")
         except ConnectionError as e:
             raise ConnectionError("Redis connection failed during XREADGROUP") from e
@@ -317,8 +326,7 @@ class CustomRedisClient:
         if not message_ids:
             return
         await self._execute_resiliently(
-            lambda pool: pool.xack(stream_name, group_name, *message_ids),
-            "xack"
+            lambda pool: pool.xack(stream_name, group_name, *message_ids), "xack"
         )
 
     async def xautoclaim_stale_messages(
@@ -339,7 +347,7 @@ class CustomRedisClient:
                     start_id="0-0",
                     count=count,
                 ),
-                "xautoclaim"
+                "xautoclaim",
             )
         except redis_exceptions.ResponseError as e:
             log.warning(f"Could not run XAUTOCLAIM on '{stream_name}': {e}.")
@@ -398,6 +406,7 @@ class CustomRedisClient:
         Sets the global system state.
         """
         try:
+
             async def command(pool: aioredis.Redis):
                 state_data = {
                     "status": state,
@@ -406,6 +415,7 @@ class CustomRedisClient:
                 }
                 await pool.hset("system:state", mapping=state_data)
                 await pool.set("system:state:simple", state)
+
             await self._execute_resiliently(command, "hset/set")
 
             log_message = f"System state transitioned to: {state.upper()}"
@@ -424,14 +434,14 @@ class CustomRedisClient:
         )
         log.info(f"Cleared Redis queue: {self._OHLC_WORK_QUEUE_KEY}")
 
-
     async def enqueue_ohlc_work(
         self,
         work_item: dict[str, Any],
     ):
         """Adds a new OHLC backfill task to the left of the list (queue)."""
         await self._execute_resiliently(
-            lambda pool: pool.lpush(self._OHLC_WORK_QUEUE_KEY, orjson.dumps(work_item)), "lpush"
+            lambda pool: pool.lpush(self._OHLC_WORK_QUEUE_KEY, orjson.dumps(work_item)),
+            "lpush",
         )
 
     async def enqueue_failed_ohlc_work(
@@ -441,7 +451,10 @@ class CustomRedisClient:
         """Adds a failed OHLC backfill task to the DLQ."""
         try:
             await self._execute_resiliently(
-                lambda pool: pool.lpush(self._OHLC_FAILED_QUEUE_KEY, orjson.dumps(work_item)), "lpush_dlq"
+                lambda pool: pool.lpush(
+                    self._OHLC_FAILED_QUEUE_KEY, orjson.dumps(work_item)
+                ),
+                "lpush_dlq",
             )
             log.error(f"Moved failed OHLC work item to DLQ: {work_item}")
         except Exception as e:
