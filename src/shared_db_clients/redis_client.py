@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Callable, Awaitable, TypeVar
 
 import orjson
 import redis.asyncio as aioredis
@@ -12,6 +12,9 @@ from redis import exceptions as redis_exceptions
 from shared_config.config import settings
 
 log = logging.getLogger(__name__)
+
+# Type variable for the resilient executor's return type
+T = TypeVar("T")
 
 
 class CustomRedisClient:
@@ -50,6 +53,13 @@ class CustomRedisClient:
                         password=redis_config.password,
                         db=redis_config.db,
                         socket_connect_timeout=2,
+                        # [MODIFICATION] Enable TCP keepalives for network resilience
+                        socket_keepalive=True,
+                        socket_keepalive_options={
+                            "TCP_KEEPIDLE": 60,
+                            "TCP_KEEPINTVL": 30,
+                            "TCP_KEEPCNT": 5,
+                        },
                         max_connections=30,
                         encoding="utf-8",
                         decode_responses=False,
@@ -81,26 +91,77 @@ class CustomRedisClient:
             finally:
                 self.pool = None
 
+    # [MODIFICATION] Centralized resilient command executor
+    async def _execute_resiliently(
+        self,
+        func: Callable[[aioredis.Redis], Awaitable[T]],
+        command_name_for_logging: str,
+    ) -> T:
+        """
+
+        Executes a given Redis command function with a resilient retry mechanism.
+
+        This wrapper is the core of the client's high-availability strategy.
+        It transparently handles transient network issues by retrying commands
+        that fail due to connection or timeout errors.
+
+        Behavior:
+        - Attempts to execute the command up to 3 times.
+        - Implements an exponential backoff delay between retries (0.5s, 1.0s).
+        - Catches specific, recoverable exceptions: `redis.exceptions.ConnectionError`
+          and `redis.exceptions.TimeoutError`.
+        - If all retries fail, it re-raises a `ConnectionError` that chains
+          the original exception for full context.
+
+        Args:
+            func: An awaitable function that takes a Redis pool instance and
+                  executes one or more commands.
+            command_name_for_logging: A string name for the command used in
+                                      log messages for clarity.
+
+        Returns:
+            The return value of the provided `func` on a successful execution.
+
+        Raises:
+            ConnectionError: If the command fails after all retry attempts.
+            redis.exceptions.RedisError: For non-recoverable Redis errors
+                                         (e.g., syntax errors, wrong key type).
+        """
+        
+        last_exception: Exception | None = None
+        for attempt in range(3):  # Total of 3 attempts
+            try:
+                pool = await self.get_pool()
+                return await func(pool)
+            except (
+                redis_exceptions.ConnectionError,
+                redis_exceptions.TimeoutError,
+                TimeoutError,
+            ) as e:
+                log.warning(
+                    f"Redis command '{command_name_for_logging}' failed "
+                    f"(attempt {attempt + 1}/3): {e}"
+                )
+                last_exception = e
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2**attempt))
+        
+        log.error(f"Redis command '{command_name_for_logging}' failed after 3 attempts.")
+        raise ConnectionError(
+            f"Failed to execute Redis command '{command_name_for_logging}' after retries."
+        ) from last_exception
+
     @staticmethod
     def parse_stream_message(message_data: dict[bytes, bytes]) -> dict:
-        """
-        Correctly parse Redis stream message.
-        Optimized to check for known JSON keys first to avoid exception overhead.
-        """
         result = {}
         for key, value in message_data.items():
             k = key.decode("utf-8")
-
-            # OPTIMIZATION: 99% of our stream data is in these keys.
-            # Checking them explicitly avoids the expensive orjson exception loop.
             if k in ("data", "payload", "order", "trade", "kline"):
                 try:
                     result[k] = orjson.loads(value)
                     continue
                 except (orjson.JSONDecodeError, TypeError):
                     pass
-
-            # Fallback loop for unknown keys or plain strings
             try:
                 result[k] = orjson.loads(value)
             except (orjson.JSONDecodeError, TypeError):
@@ -111,6 +172,7 @@ class CustomRedisClient:
                     result[k] = value
         return result
 
+    # [MODIFICATION] Refactored to use the resilient executor
     async def xadd_bulk(
         self,
         stream_name: str,
@@ -125,10 +187,9 @@ class CustomRedisClient:
 
         for chunk_start in range(0, len(message_list), CHUNK_SIZE):
             chunk = message_list[chunk_start : chunk_start + CHUNK_SIZE]
-            for attempt in range(3):
-                try:
+            try:
+                async def command(pool: aioredis.Redis):
                     async with self._write_sem:
-                        pool = await self.get_pool()
                         pipe = pool.pipeline()
                         for msg in chunk:
                             encoded_msg = {
@@ -146,67 +207,44 @@ class CustomRedisClient:
                                 approximate=True,
                             )
                         await pipe.execute()
-                        break
+                
+                await self._execute_resiliently(command, "pipeline.execute(xadd)")
+            
+            except (ConnectionError, redis_exceptions.ResponseError) as e:
+                log.error(
+                    f"Final attempt to send chunk failed. Moving to DLQ stream. Error: {e}"
+                )
+                await self.xadd_to_dlq(stream_name, chunk)
+                raise ConnectionError(
+                    "Failed to write to Redis stream after retries."
+                ) from e
 
-                except (
-                    TimeoutError,
-                    redis_exceptions.ConnectionError,
-                    redis_exceptions.ResponseError,
-                ) as e:
-                    log.warning(
-                        f"Failed to send chunk to Redis (attempt {attempt + 1}/3): {e}"
-                    )
-                    if attempt == 2:
-                        log.error(
-                            "Final attempt to send chunk failed. Moving to DLQ stream."
-                        )
-                        await self.xadd_to_dlq(stream_name, chunk)
-                        raise ConnectionError(
-                            "Failed to write to Redis stream after retries."
-                        ) from e
-                    await asyncio.sleep(0.5 * (2**attempt))
-
-    async def xadd_to_dlq(
-        self,
-        original_stream_name: str,
-        failed_messages: list[dict],
-    ):
-        if not failed_messages:
-            return
-
+    async def xadd_to_dlq(self, original_stream_name: str, failed_messages: list[dict]):
+        if not failed_messages: return
         dlq_stream_name = f"dlq:{original_stream_name}"
         try:
-            pool = await self.get_pool()
-            pipe = pool.pipeline()
-            for msg in failed_messages:
-                pipe.xadd(dlq_stream_name, {"payload": orjson.dumps(msg)}, maxlen=25000)
-            await pipe.execute()
+            async def command(pool: aioredis.Redis):
+                pipe = pool.pipeline()
+                for msg in failed_messages:
+                    pipe.xadd(dlq_stream_name, {"payload": orjson.dumps(msg)}, maxlen=25000)
+                await pipe.execute()
+            
+            await self._execute_resiliently(command, "pipeline.execute(xadd_dlq)")
             log.warning(
-                f"{len(failed_messages)} message(s) moved to DLQ stream "
-                f"'{dlq_stream_name}'"
+                f"{len(failed_messages)} message(s) moved to DLQ stream '{dlq_stream_name}'"
             )
         except Exception as e:
             log.critical(
                 f"CRITICAL: Failed to write to DLQ stream '{dlq_stream_name}': {e}"
             )
 
-    async def ensure_consumer_group(
-        self,
-        stream_name: str,
-        group_name: str,
-    ):
+    async def ensure_consumer_group(self, stream_name: str, group_name: str):
         try:
-            pool = await self.get_pool()
-            await pool.xgroup_create(
-                stream_name,
-                group_name,
-                id="0",
-                mkstream=True,
+            await self._execute_resiliently(
+                lambda pool: pool.xgroup_create(stream_name, group_name, id="0", mkstream=True),
+                "xgroup_create"
             )
-
-            log.info(
-                f"Created consumer group '{group_name}' for stream '{stream_name}'."
-            )
+            log.info(f"Created consumer group '{group_name}' for stream '{stream_name}'.")
         except redis_exceptions.ResponseError as e:
             if "BUSYGROUP" in str(e):
                 log.debug(f"Consumer group '{group_name}' already exists.")
@@ -214,64 +252,44 @@ class CustomRedisClient:
                 raise
 
     async def read_stream_messages(
-        self,
-        stream_name: str,
-        group_name: str,
-        consumer_name: str,
-        count: int = 250,
-        block: int = 2000,
+        self, stream_name: str, group_name: str, consumer_name: str, count: int = 250, block: int = 2000,
     ) -> list:
         try:
-            pool = await self.get_pool()
-            response = await pool.xreadgroup(
-                groupname=group_name,
-                consumername=consumer_name,
-                streams={stream_name: ">"},
-                count=count,
-                block=block,
-            )
-            return response[0][1] if response else []
-        except redis_exceptions.ResponseError as e:
-            if "NOGROUP" in str(e):
-                log.warning(
-                    f"Consumer group '{group_name}' missing for "
-                    f"stream '{stream_name}', recreating..."
-                )
-                await self.ensure_consumer_group(stream_name, group_name)
-                return []
-            raise
-        except (redis_exceptions.ConnectionError, redis_exceptions.TimeoutError) as e:
+            async def command(pool: aioredis.Redis):
+                try:
+                    response = await pool.xreadgroup(
+                        groupname=group_name, consumername=consumer_name,
+                        streams={stream_name: ">"}, count=count, block=block,
+                    )
+                    return response[0][1] if response else []
+                except redis_exceptions.ResponseError as e:
+                    if "NOGROUP" in str(e):
+                        log.warning(f"Consumer group '{group_name}' missing for stream '{stream_name}', recreating...")
+                        await self.ensure_consumer_group(stream_name, group_name)
+                        return []
+                    raise
+            
+            return await self._execute_resiliently(command, "xreadgroup")
+        except ConnectionError as e:
             raise ConnectionError("Redis connection failed during XREADGROUP") from e
 
-    async def acknowledge_message(
-        self,
-        stream_name: str,
-        group_name: str,
-        *message_ids: str,
-    ) -> None:
-        if not message_ids:
-            return
-        pool = await self.get_pool()
-        await pool.xack(stream_name, group_name, *message_ids)
+    async def acknowledge_message(self, stream_name: str, group_name: str, *message_ids: str):
+        if not message_ids: return
+        await self._execute_resiliently(
+            lambda pool: pool.xack(stream_name, group_name, *message_ids),
+            "xack"
+        )
 
     async def xautoclaim_stale_messages(
-        self,
-        stream_name: str,
-        group_name: str,
-        consumer_name: str,
-        min_idle_time_ms: int,
-        count: int = 100,
+        self, stream_name: str, group_name: str, consumer_name: str, min_idle_time_ms: int, count: int = 100,
     ) -> tuple[bytes, list]:
         try:
-            pool = await self.get_pool()
-
-            return await pool.xautoclaim(
-                name=stream_name,
-                groupname=group_name,
-                consumername=consumer_name,
-                min_idle_time=min_idle_time_ms,
-                start_id="0-0",
-                count=count,
+            return await self._execute_resiliently(
+                lambda pool: pool.xautoclaim(
+                    name=stream_name, groupname=group_name, consumername=consumer_name,
+                    min_idle_time=min_idle_time_ms, start_id="0-0", count=count,
+                ),
+                "xautoclaim"
             )
         except redis_exceptions.ResponseError as e:
             log.warning(f"Could not run XAUTOCLAIM on '{stream_name}': {e}.")
@@ -280,124 +298,68 @@ class CustomRedisClient:
             log.error(f"An unexpected error occurred during XAUTOCLAIM: {e}")
             raise
 
-    async def get_ticker_data(
-        self,
-        instrument_name: str,
-    ) -> dict[str, Any] | None:
-        """
-        Retrieves the full ticker data object for a given instrument from Redis.
-        """
+    async def get_ticker_data(self, instrument_name: str) -> dict[str, Any] | None:
         key = f"ticker:{instrument_name}"
         try:
-            pool = await self.get_pool()
-            payload = await pool.hget(key, "payload")
-            if payload:
-                return orjson.loads(payload)
-            return None
-        except (TimeoutError, redis_exceptions.ConnectionError) as e:
-            log.error(
-                f"Failed to get ticker data for '{instrument_name}' from Redis: {e}"
+            payload = await self._execute_resiliently(
+                lambda pool: pool.hget(key, "payload"), "hget"
             )
-            raise ConnectionError(
-                f"Redis connection failed during ticker read for {instrument_name}"
-            ) from e
+            return orjson.loads(payload) if payload else None
+        except ConnectionError as e:
+            raise ConnectionError(f"Redis connection failed during ticker read for {instrument_name}") from e
         except Exception as e:
-            log.error(
-                f"An unexpected error occurred getting ticker '{instrument_name}': {e}"
-            )
+            log.error(f"An unexpected error occurred getting ticker '{instrument_name}': {e}")
             return None
 
     async def get_system_state(self) -> str:
-        """Retrieves global system state, defaulting to LOCKED on failure."""
         try:
-            pool = await self.get_pool()
-            state = await pool.get("system:state:simple")
-            if state:
-                return state.decode()
-            old_state = await pool.get("system:state")
+            state = await self._execute_resiliently(lambda pool: pool.get("system:state:simple"), "get")
+            if state: return state.decode()
+            old_state = await self._execute_resiliently(lambda pool: pool.get("system:state"), "get")
             return old_state.decode() if old_state else "LOCKED"
         except ConnectionError:
-            log.warning(
-                "Could not get system state due to Redis connection error. "
-                "Defaulting to LOCKED."
-            )
+            log.warning("Could not get system state due to Redis connection error. Defaulting to LOCKED.")
             return "LOCKED"
 
-    async def set_system_state(
-        self,
-        state: str,
-        reason: str | None = None,
-    ):
-        """
-        Sets the global system state.
-        """
+    async def set_system_state(self, state: str, reason: str | None = None):
         try:
-            pool = await self.get_pool()
-            state_data = {
-                "status": state,
-                "reason": reason or "",
-                "timestamp": time.time(),
-            }
-            await pool.hset("system:state", mapping=state_data)
-            await pool.set("system:state:simple", state)
-
-            log_message = f"System state transitioned to: {state.upper()}"
-            if reason:
-                log_message += f" (Reason: {reason})"
-            log.info(log_message)
+            async def command(pool: aioredis.Redis):
+                state_data = {"status": state, "reason": reason or "", "timestamp": time.time()}
+                await pool.hset("system:state", mapping=state_data)
+                await pool.set("system:state:simple", state)
+            
+            await self._execute_resiliently(command, "hset/set")
+            log.info(f"System state transitioned to: {state.upper()}" + (f" (Reason: {reason})" if reason else ""))
         except ConnectionError:
-            log.error(
-                f"Could not set system state to '{state}' due to Redis connection error."
-            )
+            log.error(f"Could not set system state to '{state}' due to Redis connection error.")
 
     async def clear_ohlc_work_queue(self):
-        """Deletes the OHLC work queue, ensuring a fresh start."""
-        try:
-            pool = await self.get_pool()
-            await pool.delete(self._OHLC_WORK_QUEUE_KEY)
-            log.info(f"Cleared Redis queue: {self._OHLC_WORK_QUEUE_KEY}")
-        except Exception as e:
-            log.error(f"Failed to clear OHLC work queue: {e}")
-            raise
+        await self._execute_resiliently(
+            lambda pool: pool.delete(self._OHLC_WORK_QUEUE_KEY), "delete"
+        )
+        log.info(f"Cleared Redis queue: {self._OHLC_WORK_QUEUE_KEY}")
 
-    async def enqueue_ohlc_work(
-        self,
-        work_item: dict[str, Any],
-    ):
-        """Adds a new OHLC backfill task to the left of the list (queue)."""
-        try:
-            pool = await self.get_pool()
-            await pool.lpush(self._OHLC_WORK_QUEUE_KEY, orjson.dumps(work_item))
-        except Exception as e:
-            log.error(f"Failed to enqueue OHLC work item {work_item}: {e}")
-            raise
+    async def enqueue_ohlc_work(self, work_item: dict[str, Any]):
+        await self._execute_resiliently(
+            lambda pool: pool.lpush(self._OHLC_WORK_QUEUE_KEY, orjson.dumps(work_item)), "lpush"
+        )
 
-    async def enqueue_failed_ohlc_work(
-        self,
-        work_item: dict[str, Any],
-    ):
-        """Adds a failed OHLC backfill task to the DLQ."""
+    async def enqueue_failed_ohlc_work(self, work_item: dict[str, Any]):
         try:
-            pool = await self.get_pool()
-            await pool.lpush(self._OHLC_FAILED_QUEUE_KEY, orjson.dumps(work_item))
+            await self._execute_resiliently(
+                lambda pool: pool.lpush(self._OHLC_FAILED_QUEUE_KEY, orjson.dumps(work_item)), "lpush_dlq"
+            )
             log.error(f"Moved failed OHLC work item to DLQ: {work_item}")
         except Exception as e:
-            log.critical(
-                f"CRITICAL: Failed to enqueue to DLQ. Item lost: {work_item}. Error: {e}"
-            )
+            log.critical(f"CRITICAL: Failed to enqueue to DLQ. Item lost: {work_item}. Error: {e}")
 
     async def dequeue_ohlc_work(self) -> dict[str, Any] | None:
-        """
-        Atomically retrieves and removes a task from the right of the list (queue).
-        Uses a blocking pop with a timeout to be efficient.
-        """
         try:
-            pool = await self.get_pool()
-            result = await pool.brpop(self._OHLC_WORK_QUEUE_KEY, timeout=5)
-            if result:
-                return orjson.loads(result[1])
-            return None
-        except (TimeoutError, redis_exceptions.ConnectionError):
+            result = await self._execute_resiliently(
+                lambda pool: pool.brpop(self._OHLC_WORK_QUEUE_KEY, timeout=5), "brpop"
+            )
+            return orjson.loads(result[1]) if result else None
+        except ConnectionError:
             log.warning("Redis connection issue during dequeue, returning None.")
             return None
         except Exception as e:
@@ -405,10 +367,10 @@ class CustomRedisClient:
             return None
 
     async def get_ohlc_work_queue_size(self) -> int:
-        """Returns the current number of items in the OHLC work queue."""
         try:
-            pool = await self.get_pool()
-            return await pool.llen(self._OHLC_WORK_QUEUE_KEY)
-        except Exception as e:
-            log.error(f"Failed to get OHLC work queue size: {e}")
+            return await self._execute_resiliently(
+                lambda pool: pool.llen(self._OHLC_WORK_QUEUE_KEY), "llen"
+            )
+        except ConnectionError:
+            log.error("Failed to get OHLC work queue size due to connection error.")
             return 0
