@@ -50,14 +50,12 @@ class CustomRedisClient:
             for attempt in range(5):
                 try:
                     
-                    
-                    # [START DIAGNOSTIC MODIFICATION]
-                    log.debug(
-                        f"Attempting Redis connection with "
+                    # [START CORRECTED DIAGNOSTIC MODIFICATION]
+                    log.info(
+                        f"DIAGNOSTIC: Attempting Redis connection with "
                         f"db='{redis_config.db}' (type: {type(redis_config.db)})"
                     )
-                    # [END DIAGNOSTIC MODIFICATION]
-
+                    # [END CORRECTED DIAGNOSTIC MODIFICATION]
 
                     self.pool = aioredis.from_url(
                         redis_config.url,
