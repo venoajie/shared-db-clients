@@ -22,7 +22,6 @@ class PostgresClient:
         self.postgres_settings = config or settings.postgres
         self.dsn = self.postgres_settings.dsn if self.postgres_settings else None
 
-    # [REFACTOR] New resilient execution wrapper for all Postgres commands
     async def _execute_resiliently(
         self,
         command_func: Callable[[asyncpg.Connection], Awaitable[T]],
@@ -60,7 +59,6 @@ class PostgresClient:
             f"Failed to execute Postgres command '{command_name_for_logging}' after retries."
         ) from last_exception
 
-    # [REFACTOR] Simplified start_pool to be idempotent and use the resilient wrapper
     async def start_pool(self) -> asyncpg.Pool:
         async with self._lock:
             if self._pool is not None and not self._pool._closed:
@@ -120,9 +118,7 @@ class PostgresClient:
         records = [self._prepare_ohlc_record(c) for c in candles]
 
         async def command(conn: asyncpg.Connection):
-            # [REFACTOR] The retry loop is removed; the wrapper handles it.
-            # The specific error check for "does not exist" remains, as it's an
-            # application-level concern, not a connection error.
+            
             try:
                 async with conn.transaction():
                     await conn.execute(
@@ -197,7 +193,6 @@ class PostgresClient:
             f"Set bootstrap_status:{exchange_name} to '{'complete' if is_complete else 'incomplete'}' in database."
         )
 
-    # ... Other helper methods like _parse_resolution_to_timedelta and _prepare_ohlc_record remain unchanged ...
     def _parse_resolution_to_timedelta(
         self,
         resolution: str,
