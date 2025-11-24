@@ -1,3 +1,4 @@
+
 # src\shared_db_clients\redis_client.py
 
 
@@ -9,7 +10,7 @@ from typing import Any, TypeVar
 
 import orjson
 import redis.asyncio as aioredis
-from loguru import logger as log  # [FIX] Use loguru for consistent logging
+from loguru import logger as log
 from redis import exceptions as redis_exceptions
 from shared_config.config import settings
 
@@ -50,9 +51,8 @@ class CustomRedisClient:
                     self.pool = aioredis.from_url(
                         redis_config.url,
                         password=redis_config.password,
-                        db=int(
-                            redis_config.db
-                        ),  # [FIX] Explicitly cast db to int to resolve TypeError
+                        # FIX: Robustly handle cases where redis_config.db might be None or an empty string.
+                        db=int(redis_config.db or 0),
                         socket_connect_timeout=2,
                         socket_keepalive=True,
                         socket_keepalive_options={
