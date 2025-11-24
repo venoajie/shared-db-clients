@@ -1,8 +1,9 @@
 # src\shared_db_clients\postgres_client.py
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Awaitable, TypeVar
+from typing import Any, TypeVar
 
 import asyncpg
 import orjson
@@ -11,6 +12,7 @@ from shared_config.config import PostgresSettings, settings
 
 # Type variable for the resilient executor's return type
 T = TypeVar("T")
+
 
 class PostgresClient:
     _pool: asyncpg.Pool | None = None
@@ -22,9 +24,9 @@ class PostgresClient:
 
     # [REFACTOR] New resilient execution wrapper for all Postgres commands
     async def _execute_resiliently(
-        self, 
+        self,
         command_func: Callable[[asyncpg.Connection], Awaitable[T]],
-        command_name_for_logging: str
+        command_name_for_logging: str,
     ) -> T:
         """
         Executes a PostgreSQL command with a retry mechanism for connection errors.
@@ -51,11 +53,12 @@ class PostgresClient:
                 if attempt < 2:
                     await asyncio.sleep(0.5 * (2**attempt))
 
-        log.error(f"Postgres command '{command_name_for_logging}' failed after 3 attempts.")
+        log.error(
+            f"Postgres command '{command_name_for_logging}' failed after 3 attempts."
+        )
         raise ConnectionError(
             f"Failed to execute Postgres command '{command_name_for_logging}' after retries."
         ) from last_exception
-
 
     # [REFACTOR] Simplified start_pool to be idempotent and use the resilient wrapper
     async def start_pool(self) -> asyncpg.Pool:
@@ -64,10 +67,12 @@ class PostgresClient:
                 return self._pool
 
             if not self.dsn:
-                raise ValueError("Cannot start PostgreSQL pool: No configuration found.")
+                raise ValueError(
+                    "Cannot start PostgreSQL pool: No configuration found."
+                )
 
             log.info("PostgreSQL connection pool is not available. Creating new pool.")
-            
+
             async def create_action(_: asyncpg.Connection) -> asyncpg.Pool:
                 # The lambda wrapper for _execute_resiliently requires a conn argument,
                 # but create_pool doesn't use it. We accept it to match the signature.
@@ -82,14 +87,14 @@ class PostgresClient:
 
             # This is a special case of the executor that doesn't use an existing connection
             try:
-                self._pool = await create_action(None) # type: ignore
+                self._pool = await create_action(None)  # type: ignore
                 log.info("PostgreSQL pool created successfully.")
                 return self._pool
             except Exception as e:
-                 raise ConnectionError(
+                raise ConnectionError(
                     "Fatal: Could not create PostgreSQL pool after multiple retries."
                 ) from e
-                
+
     async def close_pool(self):
         async with self._lock:
             if self._pool and not self._pool._closed:
@@ -105,11 +110,12 @@ class PostgresClient:
                 decoder=orjson.loads,
                 schema="pg_catalog",
             )
-            
+
     # --- All public methods are now refactored to use _execute_resiliently ---
-    
+
     async def bulk_upsert_ohlc(self, candles: list[dict[str, Any]]):
-        if not candles: return
+        if not candles:
+            return
 
         records = [self._prepare_ohlc_record(c) for c in candles]
 
@@ -119,34 +125,44 @@ class PostgresClient:
             # application-level concern, not a connection error.
             try:
                 async with conn.transaction():
-                    await conn.execute("SELECT bulk_upsert_ohlc($1::ohlc_upsert_type[])", records)
+                    await conn.execute(
+                        "SELECT bulk_upsert_ohlc($1::ohlc_upsert_type[])", records
+                    )
             except asyncpg.PostgresError as e:
                 if "does not exist" in str(e):
-                    log.warning(f"Database schema not ready for OHLC upsert. Error: {e}")
+                    log.warning(
+                        f"Database schema not ready for OHLC upsert. Error: {e}"
+                    )
                     # This will be retried by the wrapper.
-                raise e # Re-raise to allow the resilient wrapper to catch it if it's a connection issue
+                raise e  # Re-raise to allow the resilient wrapper to catch it if it's a connection issue
 
         try:
             await self._execute_resiliently(command, "bulk_upsert_ohlc")
         except Exception as e:
             log.error(f"Failed to execute bulk_upsert_ohlc after retries: {e}")
             raise
-            
+
     async def fetch_all_instruments(self) -> list[asyncpg.Record]:
         async def command(conn: asyncpg.Connection):
             return await conn.fetch("SELECT * FROM v_instruments")
+
         return await self._execute_resiliently(command, "fetch_all_instruments")
 
-    async def fetch_active_trades(self, user_id: str | None = None) -> list[asyncpg.Record]:
+    async def fetch_active_trades(
+        self, user_id: str | None = None
+    ) -> list[asyncpg.Record]:
         async def command(conn: asyncpg.Connection):
             query = "SELECT * FROM v_active_trades"
             params = [user_id] if user_id else []
             if user_id:
                 query += " WHERE user_id = $1"
             return await conn.fetch(query, *params)
+
         return await self._execute_resiliently(command, "fetch_active_trades")
-        
-    async def fetch_open_orders(self, user_id: str | None = None) -> list[asyncpg.Record]:
+
+    async def fetch_open_orders(
+        self, user_id: str | None = None
+    ) -> list[asyncpg.Record]:
         async def command(conn: asyncpg.Connection):
             query = "SELECT * FROM orders WHERE trade_id IS NULL"
             params = [user_id] if user_id else []
@@ -154,6 +170,7 @@ class PostgresClient:
                 query += " AND user_id = $1"
             query += " ORDER BY exchange_timestamp"
             return await conn.fetch(query, *params)
+
         return await self._execute_resiliently(command, "fetch_open_orders")
 
     async def check_bootstrap_status(self, exchange_name: str) -> bool:
@@ -162,6 +179,7 @@ class PostgresClient:
             query = "SELECT value FROM system_metadata WHERE key = $1"
             result = await conn.fetchval(query, key)
             return result == "complete"
+
         return await self._execute_resiliently(command, "check_bootstrap_status")
 
     async def set_bootstrap_status(self, is_complete: bool, exchange_name: str):
@@ -173,10 +191,12 @@ class PostgresClient:
             """
             status = "complete" if is_complete else "incomplete"
             await conn.execute(query, key, status)
-        
+
         await self._execute_resiliently(command, "set_bootstrap_status")
-        log.info(f"Set bootstrap_status:{exchange_name} to '{'complete' if is_complete else 'incomplete'}' in database.")
-    
+        log.info(
+            f"Set bootstrap_status:{exchange_name} to '{'complete' if is_complete else 'incomplete'}' in database."
+        )
+
     # ... Other helper methods like _parse_resolution_to_timedelta and _prepare_ohlc_record remain unchanged ...
     def _parse_resolution_to_timedelta(
         self,
@@ -239,7 +259,7 @@ class PostgresClient:
     ):
         if not tickers_data:
             return
-        
+
         records_to_upsert = []
         for ticker in tickers_data:
             ts_ms = ticker.get("exchange_timestamp")
