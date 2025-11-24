@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shared-db-clients"
-version = "0.1.0"
+version = "0.1.1"
 authors = [
   { name = "Trading Systems Team", email = "ven.ajie@protonmail.com" },
 ]
@@ -26,7 +26,7 @@ dependencies = [
     "orjson==3.10.18",
     "redis==5.0.4",
     "tomli==2.0.1",
-    "shared-config @ git+https://github.com/venoajie/shared-config.git@v0.1.0",
+    "shared-config @ git+https://github.com/venoajie/shared-config.git@v0.1.1",
 ]
 
 [project.urls]
