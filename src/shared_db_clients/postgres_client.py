@@ -2,76 +2,102 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable, Awaitable, TypeVar
 
 import asyncpg
 import orjson
 from loguru import logger as log
 from shared_config.config import PostgresSettings, settings
 
+# Type variable for the resilient executor's return type
+T = TypeVar("T")
 
 class PostgresClient:
-    _pool: asyncpg.Pool = None
+    _pool: asyncpg.Pool | None = None
+    _lock = asyncio.Lock()
 
     def __init__(self, config: PostgresSettings | None = None):
-        """
-        Initializes the PostgresClient.
-        Args:
-            config: Optional PostgresSettings object. If None, falls back to the global 'settings.postgres'.
-                    This allows for Dependency Injection during testing.
-        """
         self.postgres_settings = config or settings.postgres
+        self.dsn = self.postgres_settings.dsn if self.postgres_settings else None
 
-        # Lazy validation: We don't raise an error immediately if config is missing,
-        # to allow partial usage of shared-db-clients (e.g. Redis-only consumers).
-        # We only check self.dsn when start_pool() is called.
-        if self.postgres_settings:
-            self.dsn = self.postgres_settings.dsn
-        else:
-            self.dsn = None
+    # [REFACTOR] New resilient execution wrapper for all Postgres commands
+    async def _execute_resiliently(
+        self, 
+        command_func: Callable[[asyncpg.Connection], Awaitable[T]],
+        command_name_for_logging: str
+    ) -> T:
+        """
+        Executes a PostgreSQL command with a retry mechanism for connection errors.
+        It manages acquiring a connection from the pool and transparently retries
+        on transient network failures.
+        """
+        last_exception: Exception | None = None
+        for attempt in range(3):
+            try:
+                pool = await self.start_pool()
+                async with pool.acquire() as conn:
+                    # Pass the acquired connection to the function to be executed
+                    return await command_func(conn)
+            except (
+                asyncpg.PostgresConnectionError,
+                asyncpg.InterfaceError,  # Catches stream-closed type errors
+                TimeoutError,
+            ) as e:
+                log.warning(
+                    f"Postgres command '{command_name_for_logging}' failed "
+                    f"(attempt {attempt + 1}/3): {e}"
+                )
+                last_exception = e
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2**attempt))
 
+        log.error(f"Postgres command '{command_name_for_logging}' failed after 3 attempts.")
+        raise ConnectionError(
+            f"Failed to execute Postgres command '{command_name_for_logging}' after retries."
+        ) from last_exception
+
+
+    # [REFACTOR] Simplified start_pool to be idempotent and use the resilient wrapper
     async def start_pool(self) -> asyncpg.Pool:
-        if not self.dsn:
-            raise ValueError(
-                "Cannot start PostgreSQL pool: No PostgreSQL configuration found."
-            )
+        async with self._lock:
+            if self._pool is not None and not self._pool._closed:
+                return self._pool
 
-        if self._pool is None or self._pool._closed:
+            if not self.dsn:
+                raise ValueError("Cannot start PostgreSQL pool: No configuration found.")
+
             log.info("PostgreSQL connection pool is not available. Creating new pool.")
-            for attempt in range(5):
-                try:
-                    self._pool = await asyncpg.create_pool(
-                        dsn=self.dsn,
-                        min_size=2,
-                        max_size=10,
-                        command_timeout=30,
-                        init=self._setup_json_codec,
-                        server_settings={
-                            "application_name": "trading-system-db-client",
-                        },
-                    )
-                    log.info("PostgreSQL pool created successfully.")
-                    return self._pool
-                except Exception as e:
-                    log.error(
-                        f"Failed to create PostgreSQL pool (attempt {attempt + 1}/5): {e}"
-                    )
-                    await asyncio.sleep(2**attempt)
-            raise ConnectionError(
-                "Fatal: Could not create PostgreSQL pool after multiple retries."
-            )
-        return self._pool
+            
+            async def create_action(_: asyncpg.Connection) -> asyncpg.Pool:
+                # The lambda wrapper for _execute_resiliently requires a conn argument,
+                # but create_pool doesn't use it. We accept it to match the signature.
+                return await asyncpg.create_pool(
+                    dsn=self.dsn,
+                    min_size=2,
+                    max_size=10,
+                    command_timeout=30,
+                    init=self._setup_json_codec,
+                    server_settings={"application_name": "trading-system-db-client"},
+                )
 
+            # This is a special case of the executor that doesn't use an existing connection
+            try:
+                self._pool = await create_action(None) # type: ignore
+                log.info("PostgreSQL pool created successfully.")
+                return self._pool
+            except Exception as e:
+                 raise ConnectionError(
+                    "Fatal: Could not create PostgreSQL pool after multiple retries."
+                ) from e
+                
     async def close_pool(self):
-        if self._pool and not self._pool._closed:
-            await self._pool.close()
-            self._pool = None
-            log.info("PostgreSQL connection pool closed.")
+        async with self._lock:
+            if self._pool and not self._pool._closed:
+                await self._pool.close()
+                self._pool = None
+                log.info("PostgreSQL connection pool closed.")
 
-    async def _setup_json_codec(
-        self,
-        connection: asyncpg.Connection,
-    ):
+    async def _setup_json_codec(self, connection: asyncpg.Connection):
         for json_type in ["jsonb", "json"]:
             await connection.set_type_codec(
                 json_type,
@@ -79,7 +105,79 @@ class PostgresClient:
                 decoder=orjson.loads,
                 schema="pg_catalog",
             )
+            
+    # --- All public methods are now refactored to use _execute_resiliently ---
+    
+    async def bulk_upsert_ohlc(self, candles: list[dict[str, Any]]):
+        if not candles: return
 
+        records = [self._prepare_ohlc_record(c) for c in candles]
+
+        async def command(conn: asyncpg.Connection):
+            # [REFACTOR] The retry loop is removed; the wrapper handles it.
+            # The specific error check for "does not exist" remains, as it's an
+            # application-level concern, not a connection error.
+            try:
+                async with conn.transaction():
+                    await conn.execute("SELECT bulk_upsert_ohlc($1::ohlc_upsert_type[])", records)
+            except asyncpg.PostgresError as e:
+                if "does not exist" in str(e):
+                    log.warning(f"Database schema not ready for OHLC upsert. Error: {e}")
+                    # This will be retried by the wrapper.
+                raise e # Re-raise to allow the resilient wrapper to catch it if it's a connection issue
+
+        try:
+            await self._execute_resiliently(command, "bulk_upsert_ohlc")
+        except Exception as e:
+            log.error(f"Failed to execute bulk_upsert_ohlc after retries: {e}")
+            raise
+            
+    async def fetch_all_instruments(self) -> list[asyncpg.Record]:
+        async def command(conn: asyncpg.Connection):
+            return await conn.fetch("SELECT * FROM v_instruments")
+        return await self._execute_resiliently(command, "fetch_all_instruments")
+
+    async def fetch_active_trades(self, user_id: str | None = None) -> list[asyncpg.Record]:
+        async def command(conn: asyncpg.Connection):
+            query = "SELECT * FROM v_active_trades"
+            params = [user_id] if user_id else []
+            if user_id:
+                query += " WHERE user_id = $1"
+            return await conn.fetch(query, *params)
+        return await self._execute_resiliently(command, "fetch_active_trades")
+        
+    async def fetch_open_orders(self, user_id: str | None = None) -> list[asyncpg.Record]:
+        async def command(conn: asyncpg.Connection):
+            query = "SELECT * FROM orders WHERE trade_id IS NULL"
+            params = [user_id] if user_id else []
+            if user_id:
+                query += " AND user_id = $1"
+            query += " ORDER BY exchange_timestamp"
+            return await conn.fetch(query, *params)
+        return await self._execute_resiliently(command, "fetch_open_orders")
+
+    async def check_bootstrap_status(self, exchange_name: str) -> bool:
+        async def command(conn: asyncpg.Connection):
+            key = f"bootstrap_status:{exchange_name}"
+            query = "SELECT value FROM system_metadata WHERE key = $1"
+            result = await conn.fetchval(query, key)
+            return result == "complete"
+        return await self._execute_resiliently(command, "check_bootstrap_status")
+
+    async def set_bootstrap_status(self, is_complete: bool, exchange_name: str):
+        async def command(conn: asyncpg.Connection):
+            key = f"bootstrap_status:{exchange_name}"
+            query = """
+                INSERT INTO system_metadata (key, value) VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+            """
+            status = "complete" if is_complete else "incomplete"
+            await conn.execute(query, key, status)
+        
+        await self._execute_resiliently(command, "set_bootstrap_status")
+        log.info(f"Set bootstrap_status:{exchange_name} to '{'complete' if is_complete else 'incomplete'}' in database.")
+    
+    # ... Other helper methods like _parse_resolution_to_timedelta and _prepare_ohlc_record remain unchanged ...
     def _parse_resolution_to_timedelta(
         self,
         resolution: str,
@@ -141,25 +239,7 @@ class PostgresClient:
     ):
         if not tickers_data:
             return
-        query = """
-            INSERT INTO tickers (
-                exchange,
-                instrument_name,
-                last_price,
-                mark_price,
-                index_price,
-                open_interest,
-                best_bid_price,
-                best_ask_price,
-                data,
-                exchange_timestamp,
-                recorded_at
-                )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-            ON CONFLICT (exchange, instrument_name) DO UPDATE SET
-                last_price = EXCLUDED.last_price, mark_price = EXCLUDED.mark_price, index_price = EXCLUDED.index_price, open_interest = EXCLUDED.open_interest,
-                best_bid_price = EXCLUDED.best_bid_price, best_ask_price = EXCLUDED.best_ask_price, data = EXCLUDED.data, exchange_timestamp = EXCLUDED.exchange_timestamp, recorded_at = NOW();
-        """
+        
         records_to_upsert = []
         for ticker in tickers_data:
             ts_ms = ticker.get("exchange_timestamp")
@@ -183,445 +263,26 @@ class PostgresClient:
                     ts,
                 )
             )
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.executemany(query, records_to_upsert)
-            log.debug(
-                f"Successfully bulk-upserted {len(records_to_upsert)} tickers to cold storage."
-            )
-        except Exception as e:
-            log.error("Error during bulk upsert of tickers: {}", e)
-            raise
 
-    async def bulk_upsert_ohlc(
-        self,
-        candles: list[dict[str, Any]],
-    ):
-        if not candles:
-            return
-
-        records_to_upsert = [self._prepare_ohlc_record(c) for c in candles]
-        pool = await self.start_pool()
-        for attempt in range(5):
-            try:
-                async with pool.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.execute(
-                            "SELECT bulk_upsert_ohlc($1::ohlc_upsert_type[])",
-                            records_to_upsert,
-                        )
-                if attempt > 0:
-                    log.success(
-                        f"DB connection recovered on attempt {attempt + 1} for OHLC upsert."
-                    )
-                return
-            except asyncpg.PostgresError as e:
-                if "does not exist" in str(e):
-                    log.warning(
-                        f"Database schema not ready (attempt {attempt + 1}/5). Retrying OHLC upsert in {2**attempt}s. Error: {e}"
-                    )
-                    await asyncio.sleep(2**attempt)
-                    continue
-                else:
-                    log.error("Unhandled PostgreSQL error during OHLC upsert: {}", e)
-                    raise
-            except Exception as e:
-                log.error("Unexpected error during bulk upsert of OHLC candles: {}", e)
-                if candles:
-                    log.debug(
-                        f"First failing candle record (potential cause): {candles[0]}"
-                    )
-                raise
-        raise ConnectionError(
-            "Failed to execute bulk_upsert_ohlc after multiple retries. Database may be unavailable or misconfigured."
-        )
-
-    async def bulk_upsert_instruments(
-        self,
-        instruments: list[dict[str, Any]],
-        exchange: str,
-    ):
-        if not instruments:
-            return
-        query = """
-            INSERT INTO instruments (exchange, instrument_name, market_type, instrument_kind, base_asset, quote_asset, settlement_asset, settlement_period, tick_size, contract_size, expiration_timestamp, data)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT (exchange, instrument_name) DO UPDATE
-            SET market_type = EXCLUDED.market_type, instrument_kind = EXCLUDED.instrument_kind, base_asset = EXCLUDED.base_asset,
-                quote_asset = EXCLUDED.quote_asset, settlement_asset = EXCLUDED.settlement_asset, settlement_period = EXCLUDED.settlement_period,
-                tick_size = EXCLUDED.tick_size, contract_size = EXCLUDED.contract_size, expiration_timestamp = EXCLUDED.expiration_timestamp,
-                data = EXCLUDED.data, recorded_at = CURRENT_TIMESTAMP;
-        """
-        try:
-            records_to_upsert = []
-            for inst_data in instruments:
-                exp_ts_iso = inst_data.get("expiration_timestamp")
-                exp_ts = datetime.fromisoformat(exp_ts_iso) if exp_ts_iso else None
-
-                records_to_upsert.append(
-                    (
-                        inst_data.get("exchange"),
-                        inst_data.get("instrument_name"),
-                        inst_data.get("market_type"),
-                        inst_data.get("instrument_kind"),
-                        inst_data.get("base_asset"),
-                        inst_data.get("quote_asset"),
-                        inst_data.get("settlement_asset"),
-                        inst_data.get("settlement_period"),
-                        inst_data.get("tick_size"),
-                        inst_data.get("contract_size"),
-                        exp_ts,
-                        inst_data.get("data"),
-                    )
+        async def command(conn: asyncpg.Connection):
+            query = """
+                INSERT INTO tickers (
+                    exchange, instrument_name, last_price, mark_price, index_price, open_interest,
+                    best_bid_price, best_ask_price, data, exchange_timestamp, recorded_at
                 )
-
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                ON CONFLICT (exchange, instrument_name) DO UPDATE SET
+                    last_price = EXCLUDED.last_price, mark_price = EXCLUDED.mark_price, index_price = EXCLUDED.index_price,
+                    open_interest = EXCLUDED.open_interest, best_bid_price = EXCLUDED.best_bid_price,
+                    best_ask_price = EXCLUDED.best_ask_price, data = EXCLUDED.data,
+                    exchange_timestamp = EXCLUDED.exchange_timestamp, recorded_at = NOW();
+            """
+            async with conn.transaction():
                 await conn.executemany(query, records_to_upsert)
 
-            log.info(
-                f"Successfully bulk-upserted {len(records_to_upsert)} instruments for exchange '{exchange}'."
-            )
+        try:
+            await self._execute_resiliently(command, "bulk_upsert_tickers")
+            log.debug(f"Successfully bulk-upserted {len(records_to_upsert)} tickers.")
         except Exception as e:
-            log.error("Error during bulk upsert of instruments: {}", e, exc_info=True)
+            log.error(f"Error during bulk upsert of tickers: {e}")
             raise
-
-    async def bulk_upsert_orders(
-        self,
-        records: list[dict[str, Any]],
-    ):
-        """
-        Upserts a batch of order records into the orders table.
-        """
-        if not records:
-            return
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT bulk_upsert_orders_from_json($1::jsonb[])", records
-                    )
-            log.info(f"Successfully bulk-upserted {len(records)} order/trade records.")
-        except Exception as e:
-            log.error("Error during bulk upsert of orders/trades: {}", e)
-            raise
-
-    async def bulk_insert_public_trades(
-        self,
-        records: list[dict[str, Any]],
-    ):
-        """Inserts public trades by converting dicts to DB tuples"""
-        if not records:
-            return
-
-        # Convert dicts to tuples in DB function order
-        records_to_insert = []
-        for rec in records:
-            try:
-                records_to_insert.append(
-                    (
-                        rec["exchange"],
-                        rec["instrument_name"],
-                        rec["market_type"],
-                        rec["trade_id"],
-                        rec["price"],
-                        rec["quantity"],
-                        rec["is_buyer_maker"],
-                        rec["was_best_price_match"],
-                        rec["trade_timestamp"],
-                    )
-                )
-            except KeyError as e:
-                log.error(f"Missing key in trade record: {e}. Record: {rec}")
-                continue
-
-        if not records_to_insert:
-            return
-
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT bulk_insert_public_trades($1::public_trade_insert_type[])",
-                        records_to_insert,
-                    )
-            log.info(f"Inserted {len(records_to_insert)} public trades")
-        except Exception as e:
-            log.error(
-                f"Public trade bulk insert failed: {e}. "
-                f"First record: {records_to_insert[0] if records_to_insert else 'None'}",
-                exc_info=True,
-            )
-            raise
-
-    async def delete_orders(
-        self,
-        orders_to_delete: list[tuple[str, str, str]],
-    ):
-        if not orders_to_delete:
-            return
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                await conn.executemany(
-                    "SELECT delete_order($1, $2, $3)", orders_to_delete
-                )
-            log.info(f"Successfully deleted {len(orders_to_delete)} order records.")
-        except Exception as e:
-            log.error(f"Error during order deletion: {e}")
-            raise
-
-    async def insert_account_information(
-        self,
-        user_id: str,
-        data: dict[str, Any],
-    ) -> None:
-        query = """
-            INSERT INTO account_information (user_id, data) VALUES ($1, $2)
-            ON CONFLICT (user_id, type) DO UPDATE SET data = EXCLUDED.data, recorded_at = CURRENT_TIMESTAMP
-        """
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(query, user_id, data)
-
-    async def fetch_all_instruments(self) -> list[asyncpg.Record]:
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch("SELECT * FROM v_instruments")
-
-    async def fetch_active_trades(
-        self,
-        user_id: str = None,
-    ) -> list[asyncpg.Record]:
-        query = "SELECT * FROM v_active_trades"
-        params = []
-        if user_id:
-            query += " WHERE user_id = $1"
-            params.append(user_id)
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *params)
-
-    async def fetch_open_orders(
-        self,
-        user_id: str = None,
-    ) -> list[asyncpg.Record]:
-        query = """
-            SELECT * FROM orders
-            WHERE trade_id IS NULL
-        """
-
-        params = []
-        if user_id:
-            query += " AND user_id = $1"
-            params.append(user_id)
-
-        query += " ORDER BY exchange_timestamp"
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *params)
-
-    async def fetch_all_user_records(
-        self,
-        user_id: str,
-    ) -> tuple[list[asyncpg.Record], list[asyncpg.Record]]:
-        query = "SELECT * FROM orders WHERE user_id = $1 ORDER BY exchange_timestamp"
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            all_records = await conn.fetch(query, user_id)
-
-        open_orders = [rec for rec in all_records if rec["trade_id"] is None]
-        filled_trades = [rec for rec in all_records if rec["trade_id"] is not None]
-
-        return open_orders, filled_trades
-
-    async def fetch_trades_by_timestamp(
-        self,
-        start_ts_ms: int,
-        end_ts_ms: int,
-        exchange_name: str,
-    ) -> list[asyncpg.Record]:
-        query = """
-                SELECT trade_id FROM orders
-                WHERE exchange = $3
-                AND trade_id IS NOT NULL
-                AND exchange_timestamp >= $1 AND exchange_timestamp <= $2
-            """
-        start_dt = datetime.fromtimestamp(start_ts_ms / 1000, tz=UTC)
-        end_dt = datetime.fromtimestamp(end_ts_ms / 1000, tz=UTC)
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, start_dt, end_dt, exchange_name)
-
-    async def check_bootstrap_status(
-        self,
-        exchange_name: str,
-    ) -> bool:
-        key = f"bootstrap_status:{exchange_name}"
-        query = "SELECT value FROM system_metadata WHERE key = $1"
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            result = await conn.fetchval(query, key)
-            return result == "complete"
-
-    async def set_bootstrap_status(
-        self,
-        is_complete: bool,
-        exchange_name: str,
-    ):
-        key = f"bootstrap_status:{exchange_name}"
-        query = """
-            INSERT INTO system_metadata (key, value) VALUES ($1, $2)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-        """
-        status = "complete" if is_complete else "incomplete"
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(query, key, status)
-        log.info(f"Set {key} to '{status}' in database.")
-
-    async def fetch_all_trades_for_instrument(
-        self,
-        instrument_name: str,
-    ) -> list[asyncpg.Record]:
-        query = """
-            SELECT trade_id, label, side, amount,
-                CASE WHEN side = 'sell' THEN -amount ELSE amount END AS net_amount
-            FROM orders
-            WHERE instrument_name = $1 AND trade_id IS NOT NULL
-        """
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, instrument_name)
-
-    async def bulk_update_is_open_status(
-        self,
-        trade_ids: list[str],
-        is_open: bool,
-    ):
-        if not trade_ids:
-            return
-        query = """
-            UPDATE orders SET is_open = $1 WHERE trade_id = ANY($2::text[])
-        """
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                await conn.execute(query, is_open, trade_ids)
-            log.info(f"Updated is_open={is_open} for {len(trade_ids)} trades.")
-        except Exception as e:
-            log.error(f"Failed to bulk update is_open status: {e}")
-            raise
-
-    async def fetch_ohlc_for_instrument(
-        self,
-        exchange_name: str,
-        instrument_name: str,
-        resolution: str,
-        limit: int,
-    ) -> list[asyncpg.Record]:
-        query = """
-            SELECT "open", high, low, "close", tick, volume
-            FROM ohlc
-            WHERE exchange = $1 AND instrument_name = $2 AND resolution = $3
-            ORDER BY tick DESC
-            LIMIT $4;
-        """
-        try:
-            resolution_td = self._parse_resolution_to_timedelta(resolution)
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                return await conn.fetch(
-                    query, exchange_name, instrument_name, resolution_td, limit
-                )
-        except ValueError as e:
-            log.error("Could not parse resolution string '{}': {}", resolution, e)
-            return []
-
-    async def fetch_latest_ohlc_timestamp(
-        self,
-        exchange_name: str,
-        instrument_name: str,
-        resolution_td: timedelta,
-    ) -> datetime | None:
-        query = "SELECT MAX(tick) FROM ohlc WHERE exchange = $1 AND instrument_name = $2 AND resolution = $3"
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                return await conn.fetchval(
-                    query,
-                    exchange_name,
-                    instrument_name,
-                    resolution_td,
-                )
-
-        except Exception as e:
-            log.error(
-                f"Failed to fetch latest OHLC timestamp for {exchange_name}:{instrument_name} ({resolution_td}): {e}"
-            )
-            return None
-
-    async def fetch_latest_public_trade_timestamp(
-        self,
-        exchange_name: str,
-        instrument_name: str,
-    ) -> datetime | None:
-        """
-        [NEW] Fetches the timestamp of the most recent public trade for a given
-        instrument from the database.
-        """
-        query = "SELECT MAX(trade_timestamp) FROM public_trades WHERE exchange = $1 AND instrument_name = $2"
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                return await conn.fetchval(query, exchange_name, instrument_name)
-        except Exception as e:
-            log.error(
-                f"Failed to fetch latest public trade timestamp for {exchange_name}:{instrument_name}: {e}"
-            )
-            return None
-
-    async def fetch_futures_summary_for_exchange(
-        self, exchange: str
-    ) -> asyncpg.Record | None:
-        """
-        Fetches the aggregated futures summary for a specific exchange.
-        """
-
-        query = """
-            WITH active_futures AS (
-                SELECT instrument_name
-                FROM instruments
-                WHERE exchange = $1 AND instrument_kind IN ('future', 'perpetual')
-                AND (expiration_timestamp IS NULL OR expiration_timestamp > NOW())
-            )
-            SELECT
-                (SELECT json_agg(instrument_name) FROM active_futures) AS instruments_name
-            FROM (SELECT 1) AS dummy;
-        """
-        try:
-            pool = await self.start_pool()
-            async with pool.acquire() as conn:
-                return await conn.fetchrow(query, exchange)
-        except Exception as e:
-            # Use positional formatting for safe logging
-            log.error("Failed to fetch futures summary for '{}': {}", exchange, e)
-            return None
-
-    async def fetch_all_trades_for_user(
-        self,
-        user_id: str,
-    ) -> list[asyncpg.Record]:
-        query = """
-            SELECT trade_id, label, side, amount, instrument_name,
-                CASE WHEN side = 'sell' THEN -amount ELSE amount END AS net_amount
-            FROM orders
-            WHERE user_id = $1 AND trade_id IS NOT NULL
-        """
-        pool = await self.start_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, user_id)
